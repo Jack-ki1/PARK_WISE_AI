@@ -1,0 +1,55 @@
+services:
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: parkwise-api
+    restart: unless-stopped
+    environment:
+      PARKWISE_ENV: ${PARKWISE_ENV:-development}
+      PARKWISE_ALLOWED_ORIGINS: ${PARKWISE_ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+      PARKWISE_DATABASE_URL: ${PARKWISE_DATABASE_URL:-sqlite:////srv/data/parkwise.db}
+      PARKWISE_DATA_DIR: /srv/data
+      PARKWISE_MAX_UPLOAD_MB: ${PARKWISE_MAX_UPLOAD_MB:-250}
+      PARKWISE_MAX_VIDEO_SECONDS: ${PARKWISE_MAX_VIDEO_SECONDS:-1800}
+      PARKWISE_MODEL: ${PARKWISE_MODEL:-yolo26s.pt}
+      PARKWISE_CONFIDENCE: ${PARKWISE_CONFIDENCE:-0.25}
+      PARKWISE_IMAGE_SIZE: ${PARKWISE_IMAGE_SIZE:-1280}
+      PARKWISE_MULTISCALE: ${PARKWISE_MULTISCALE:-true}
+      PARKWISE_FRAME_STRIDE: ${PARKWISE_FRAME_STRIDE:-3}
+      PARKWISE_DEVICE: ${PARKWISE_DEVICE:-auto}
+      PARKWISE_AUTO_DOWNLOAD_PUBLIC_SOURCES: ${PARKWISE_AUTO_DOWNLOAD_PUBLIC_SOURCES:-true}
+      PARKWISE_AUTH_REQUIRED: ${PARKWISE_AUTH_REQUIRED:-false}
+      PARKWISE_RATE_LIMIT_PER_MINUTE: ${PARKWISE_RATE_LIMIT_PER_MINUTE:-240}
+      PARKWISE_STREAM_WIDTH: ${PARKWISE_STREAM_WIDTH:-960}
+      PARKWISE_STREAM_QUALITY: ${PARKWISE_STREAM_QUALITY:-72}
+      PARKWISE_STREAM_MAX_SECONDS: ${PARKWISE_STREAM_MAX_SECONDS:-0}
+    ports:
+      - "8000:8000"
+    volumes:
+      - parkwise_data:/srv/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health', timeout=3)"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    # Video inference can need more RAM than the API alone; tune for the host.
+    shm_size: "1gb"
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    container_name: parkwise-web
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  parkwise_data:
