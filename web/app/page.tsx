@@ -14,7 +14,8 @@ import { BarChart, ChartCard, DetectionChart, Donut, Sparkline, TrendChart } fro
 import { CalibrationCanvas, EmptyTable, Fact, JobsTable, MetricCard, PanelHeader } from "@/components/ui";
 import SiteMap from "@/components/sitemap";
 import {
-  API, WS_BASE, api, confFmt, fmtDuration, fmtNum, fmtTime, statusClass, statusLabel, useTheme,
+  API, api, confFmt, fmtDuration, fmtNum, fmtTime, getApiKey, setSessionApiKey, statusClass,
+  statusLabel, streamSocketUrl, useTheme, videoSocketUrl, MAX_POLYGON_POINTS,
   type ActivityItem, type AnalyticsPayload, type BillingReport, type LiveEvent, type LiveFrame,
   type OccupancyPoint, type OccupancySeries, type Point, type PublicConfig, type ReviewedVideo,
   type SettingsPayload, type Space, type Source, type StreamRow, type Summary, type SystemInfo,
@@ -115,6 +116,7 @@ export default function HomePage() {
   const [settingsPayload, setSettingsPayload] = useState<SettingsPayload | null>(null);
   const [billingReport, setBillingReport] = useState<BillingReport | null>(null);
   const [users, setUsers] = useState<UserRow[]>([]);
+  const [usersError, setUsersError] = useState<string | null>(null);
   const [systemInfo, setSystemInfo] = useState<SystemInfo | null>(null);
   const [modelDraft, setModelDraft] = useState({ model: "", confidence: 0.4, image_size: 640, frame_stride: 4, device: "auto", multiscale: true });
   const [modelTouched, setModelTouched] = useState(false);
@@ -123,6 +125,9 @@ export default function HomePage() {
   const [newUser, setNewUser] = useState({ username: "", display_name: "", role: "operator" });
   const [plainKey, setPlainKey] = useState<{ key: string; note: string } | null>(null);
   const [webhookResult, setWebhookResult] = useState("");
+  // Session-scoped API key for this browser tab (never localStorage).
+  const [sessionKeyInput, setSessionKeyInput] = useState("");
+  const [sessionKeyActive, setSessionKeyActive] = useState(false);
 
   // Settings forms: show server values until the operator edits them (touched flag),
   // so fresh payloads never clobber in-progress typing.
@@ -138,7 +143,8 @@ export default function HomePage() {
   const centerRaw = settingsPayload?.settings.map_center;
   const serverIntDraft = {
     webhookUrl: settingsPayload?.settings.webhook_url ? String(settingsPayload.settings.webhook_url) : "",
-    webhookSecret: settingsPayload?.settings.webhook_secret ? String(settingsPayload.settings.webhook_secret) : "",
+    // Secrets are never returned by the API; the field always starts blank.
+    webhookSecret: "",
     publicSources: Boolean(settingsPayload?.settings.public_sources_enabled),
     mapStyle: settingsPayload?.settings.map_style ? String(settingsPayload.settings.map_style) : "",
     mapLat: Array.isArray(centerRaw) && typeof centerRaw[0] === "number" ? String(centerRaw[0]) : "",
@@ -156,6 +162,15 @@ export default function HomePage() {
   const analytics = analyticsByVideo[activeId] ?? [];
   const pendingPoints = pendingByVideo[activeId] ?? [];
   const updatePending = (updater: (old: number[][]) => number[][]) => setPendingByVideo(m => ({ ...m, [activeId]: updater(m[activeId] ?? []) }));
+  // Backend rejects polygons with more than MAX_POLYGON_POINTS vertices, so the
+  // editor refuses to draw past that instead of failing on save.
+  const addPolygonPoint = (point: number[], current: number[][], apply: (next: number[][]) => void) => {
+    if (current.length >= MAX_POLYGON_POINTS) {
+      setMessage({ tone: "info", text: `A polygon can have at most ${MAX_POLYGON_POINTS} points.` });
+      return;
+    }
+    apply([...current, point]);
+  };
 
   const activeStream = streams.find(s => s.id === selectedStreamId) || streams[0] || null;
   const failedVideos = videos.filter(v => v.status === "failed");
@@ -193,12 +208,18 @@ export default function HomePage() {
   const refreshAdmin = useCallback(() => Promise.all([
     api<SettingsPayload>("/api/settings"),
     api<BillingReport>("/api/billing"),
-    api<{ items: UserRow[] }>("/api/users").catch(() => ({ items: [] as UserRow[] })),
+    // Admin-only route: a viewer/operator gets 403 here, which must read as
+    // "you may not see this list", not as "there are no accounts".
+    api<{ items: UserRow[] }>("/api/users").then(
+      rows => ({ rows, error: null as string | null }),
+      (err: unknown) => ({ rows: { items: [] as UserRow[] }, error: err instanceof Error ? err.message : "Could not load accounts" }),
+    ),
     api<SystemInfo>("/api/system/info"),
   ]).then(([settingsData, billingData, userRows, system]) => {
     setSettingsPayload(settingsData);
     setBillingReport(billingData);
-    setUsers(userRows.items);
+    setUsers(userRows.rows.items);
+    setUsersError(userRows.error);
     setSystemInfo(system);
   }).catch(() => undefined), []);
 
@@ -222,50 +243,87 @@ export default function HomePage() {
       });
   }, []);
 
-  useEffect(() => { refreshData(); const timer = setInterval(() => refreshData(true), 5000); return () => clearInterval(timer); }, [refreshData]);
+  useEffect(() => {
+    refreshData();
+    // Eight GETs every 5s: pause them while the tab is in the background and
+    // refresh immediately again when the operator comes back.
+    const load = () => { if (!document.hidden) refreshData(true); };
+    const timer = setInterval(load, 5000);
+    const onVisible = () => { if (!document.hidden) refreshData(true); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { clearInterval(timer); document.removeEventListener("visibilitychange", onVisible); };
+  }, [refreshData]);
   useEffect(() => { if (activePage === "settings") refreshAdmin(); }, [activePage, refreshAdmin]);
   useEffect(() => {
     if (!activeId || (selectedStatus !== "processing" && selectedStatus !== "queued")) return;
-    const socket = new WebSocket(`${WS_BASE}/api/ws/videos/${activeId}`);
-    socket.onmessage = event => {
+    let socket: WebSocket | null = null;
+    let cancelled = false;
+    (async () => {
+      let url: string;
       try {
-        const update = JSON.parse(event.data) as { id: string; status: string; progress_percent: number; current_frame: number; processed_frames: number; error_message: string | null };
-        setVideos(current => current.map(job => job.id === update.id ? { ...job, status: update.status, progress_percent: update.progress_percent, current_frame: update.current_frame, processed_frames: update.processed_frames, error_message: update.error_message } : job));
-      } catch { /* Invalid messages are ignored; REST polling remains the fallback. */ }
-    };
-    return () => socket.close();
+        url = await videoSocketUrl(activeId);
+      } catch {
+        return; // Auth/ticket failure: REST polling below remains the fallback.
+      }
+      if (cancelled) return;
+      socket = new WebSocket(url);
+      socket.onmessage = event => {
+        try {
+          const update = JSON.parse(event.data) as { id: string; status: string; progress_percent: number; current_frame: number; processed_frames: number; error_message: string | null };
+          setVideos(current => current.map(job => job.id === update.id ? { ...job, status: update.status, progress_percent: update.progress_percent, current_frame: update.current_frame, processed_frames: update.processed_frames, error_message: update.error_message } : job));
+        } catch { /* Invalid messages are ignored; REST polling remains the fallback. */ }
+      };
+    })();
+    return () => { cancelled = true; socket?.close(); };
   }, [activeId, selectedStatus]);
   useEffect(() => { if (activeId) loadVideoDetail(activeId); }, [activeId, selectedStatus, loadVideoDetail]);
 
   // Live frame WebSocket: connects only while the Live View is open and a stream is watched.
+  // Auth uses a short-lived single-use ticket (never a durable API key in the URL).
   useEffect(() => {
     if (activePage !== "live" || !watchId) return;
-    const socket = new WebSocket(`${WS_BASE}/api/ws/streams/${watchId}`);
-    socket.onopen = () => setWsStatus("live");
-    socket.onmessage = event => {
+    let socket: WebSocket | null = null;
+    let cancelled = false;
+    (async () => {
+      let url: string;
       try {
-        const msg = JSON.parse(event.data) as Partial<LiveFrame> & { type: string };
-        if (msg.type === "frame") {
-          setLiveFrame({ ...msg, seq: msg.seq ?? 0 } as LiveFrame);
-          const events = msg.events;
-          if (events && events.length) {
-            const stamped = events.map(item => ({ ...item, ts: item.ts || new Date().toISOString() })).reverse();
-            setLiveEvents(prev => [...stamped, ...prev].slice(0, 24));
-          }
-        } else if (msg.type === "status") {
-          if (msg.status === "error") setWsStatus("error");
-          setLiveFrame(prev => prev
-            ? { ...prev, status: msg.status, error: msg.error ?? null }
-            : { type: "status", seq: 0, status: msg.status, error: msg.error ?? null });
-        } else if (msg.type === "error") {
+        url = await streamSocketUrl(watchId);
+      } catch (err) {
+        if (!cancelled) {
           setWsStatus("error");
-          setLiveFrame({ type: "error", seq: 0, status: "error", detail: msg.detail });
+          setMessage({ tone: "error", text: err instanceof Error ? err.message : "Could not authorize the stream connection." });
         }
-      } catch { /* Ignore malformed frames; the next one replaces them. */ }
-    };
-    socket.onerror = () => setWsStatus("error");
-    socket.onclose = () => setWsStatus(current => current === "error" ? "error" : "idle");
-    return () => socket.close();
+        return;
+      }
+      if (cancelled) return;
+      setWsStatus("connecting");
+      socket = new WebSocket(url);
+      socket.onopen = () => setWsStatus("live");
+      socket.onmessage = event => {
+        try {
+          const msg = JSON.parse(event.data) as Partial<LiveFrame> & { type: string };
+          if (msg.type === "frame") {
+            setLiveFrame({ ...msg, seq: msg.seq ?? 0 } as LiveFrame);
+            const events = msg.events;
+            if (events && events.length) {
+              const stamped = events.map(item => ({ ...item, ts: item.ts || new Date().toISOString() })).reverse();
+              setLiveEvents(prev => [...stamped, ...prev].slice(0, 24));
+            }
+          } else if (msg.type === "status") {
+            if (msg.status === "error") setWsStatus("error");
+            setLiveFrame(prev => prev
+              ? { ...prev, status: msg.status, error: msg.error ?? null, stale: msg.stale, source_mode: msg.source_mode }
+              : { type: "status", seq: 0, status: msg.status, error: msg.error ?? null, stale: msg.stale, source_mode: msg.source_mode });
+          } else if (msg.type === "error") {
+            setWsStatus("error");
+            setLiveFrame({ type: "error", seq: 0, status: "error", detail: msg.detail });
+          }
+        } catch { /* Ignore malformed frames; the next one replaces them. */ }
+      };
+      socket.onerror = () => setWsStatus("error");
+      socket.onclose = () => setWsStatus(current => current === "error" ? "error" : "idle");
+    })();
+    return () => { cancelled = true; socket?.close(); };
   }, [activePage, watchId]);
 
   const handleUpload = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -353,6 +411,49 @@ export default function HomePage() {
       setMessage({ tone: "success", text: successText });
     } catch (err) { setMessage({ tone: "error", text: err instanceof Error ? err.message : "Could not save settings" }); }
   };
+
+  // Webhook signing secret goes through its dedicated endpoint (the settings API
+  // refuses direct secret writes and never returns stored secret values).
+  const webhookSecretConfigured = Boolean(settingsPayload?.settings.webhook_secret_configured);
+  const saveWebhook = async () => {
+    try {
+      const next = await api<SettingsPayload>("/api/settings", {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ webhook_url: intDraftLive.webhookUrl }),
+      });
+      setSettingsPayload(next);
+      if (intDraftLive.webhookSecret.trim()) {
+        await api("/api/integrations/webhook/secret", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "set", secret: intDraftLive.webhookSecret.trim() }),
+        });
+        patchInt({ webhookSecret: "" });
+        const refreshed = await api<SettingsPayload>("/api/settings");
+        setSettingsPayload(refreshed);
+      }
+      setIntTouched(false);
+      setMessage({ tone: "success", text: "Webhook settings saved." });
+    } catch (err) {
+      setMessage({ tone: "error", text: err instanceof Error ? err.message : "Could not save webhook settings" });
+    }
+  };
+
+  const applySessionKey = () => {
+    setSessionApiKey(sessionKeyInput.trim());
+    setSessionKeyActive(Boolean(sessionKeyInput.trim()));
+    setSessionKeyInput("");
+    setMessage(sessionKeyInput.trim()
+      ? { tone: "success", text: "API key stored for this browser tab only (sessionStorage). It is cleared when the tab closes." }
+      : { tone: "info", text: "Session API key cleared." });
+    if (sessionKeyInput.trim()) refreshAdmin();
+  };
+
+  useEffect(() => {
+    // Deferred read avoids a synchronous setState in the effect body and any
+    // SSR/client hydration mismatch for the session-key indicator.
+    const timer = setTimeout(() => setSessionKeyActive(Boolean(getApiKey())), 0);
+    return () => clearTimeout(timer);
+  }, []);
 
   const createStream = async (event: FormEvent) => {
     event.preventDefault();
@@ -709,12 +810,16 @@ export default function HomePage() {
                     </div>
                   </div>
                   {streamKind === "url" ? (
-                    <div className="field-group"><label htmlFor="stream-url">STREAM URL</label><input id="stream-url" value={streamUrl} onChange={e => setStreamUrl(e.target.value)} required placeholder="rtsp://user:pass@192.168.1.10:554/stream" /></div>
+                    <div className="field-group">
+                      <label htmlFor="stream-url">STREAM URL</label>
+                      <input id="stream-url" value={streamUrl} onChange={e => setStreamUrl(e.target.value)} required placeholder="rtsp://192.168.1.10:554/stream" />
+                      <small className="field-hint">RTSP/HTTP camera URL. Embedded credentials (user:pass@) are rejected by the API — cameras must allow anonymous LAN access or use an authenticated proxy.</small>
+                    </div>
                   ) : (
                     <div className="field-group"><label htmlFor="stream-video">UPLOADED VIDEO</label><select id="stream-video" value={streamVideoId} onChange={e => setStreamVideoId(e.target.value)} required><option value="">Select a video…</option>{videos.map(job => <option key={job.id} value={job.id}>{job.source_title || job.original_name}</option>)}</select></div>
                   )}
                   <div className="stream-form-row">
-                    <div className="field-group"><label htmlFor="stream-fps">TARGET FPS</label><input id="stream-fps" type="number" min={1} max={30} value={streamFps} onChange={e => setStreamFps(e.target.value)} /></div>
+                    <div className="field-group"><label htmlFor="stream-fps">TARGET FPS</label><input id="stream-fps" type="number" min={1} max={15} value={streamFps} onChange={e => setStreamFps(e.target.value)} /></div>
                     <div className="field-group"><label htmlFor="stream-lat">LATITUDE</label><input id="stream-lat" type="number" step="0.0001" value={streamLat} onChange={e => setStreamLat(e.target.value)} placeholder="41.9028" /></div>
                     <div className="field-group"><label htmlFor="stream-lon">LONGITUDE</label><input id="stream-lon" type="number" step="0.0001" value={streamLon} onChange={e => setStreamLon(e.target.value)} placeholder="12.4964" /></div>
                   </div>
@@ -726,7 +831,7 @@ export default function HomePage() {
                     <div className={`stream-row ${activeStream?.id === stream.id ? "selected" : ""}`} key={stream.id}>
                       <div className="stream-row-head" onClick={() => setSelectedStreamId(stream.id)}>
                         <strong>{stream.name}</strong>
-                        <span className={`status-pill ${streamRunningLabel(stream) === "Live" ? "success" : stream.status === "error" ? "danger" : "neutral"}`}><span className="status-dot" />{streamRunningLabel(stream)}</span>
+                        <span className={`status-pill ${streamStatusTone(stream)}`}><span className="status-dot" />{streamRunningLabel(stream)}</span>
                       </div>
                       <div className="stream-row-meta" onClick={() => setSelectedStreamId(stream.id)}>
                         {stream.kind === "url" ? (stream.url || "Camera URL") : (stream.video_name || "Replay video")} · {stream.target_fps} fps · {stream.space_count} bays{stream.frames_delivered ? ` · ${stream.frames_delivered.toLocaleString()} frames` : ""}
@@ -753,7 +858,15 @@ export default function HomePage() {
                     <div className="viewer-frame">
                       {hudFrame?.jpeg ? (
                         <>
-                          <img src={`data:image/jpeg;base64,${hudFrame.jpeg}`} alt={`Annotated live frame from ${activeStream.name}`} />
+                          <img src={`data:image/jpeg;base64,${hudFrame.jpeg}`} alt={`Annotated frame from ${activeStream.name}`} />
+                          <div className={`viewer-source-badge ${activeStream.kind === "video" ? "replay" : "live"}`}>
+                            {activeStream.kind === "video" ? "REPLAY · RECORDED VIDEO" : "LIVE CAMERA"}
+                          </div>
+                          {(hudFrame.stale || (hudFrame.last_frame_age_ms != null && hudFrame.last_frame_age_ms > 10000)) && (
+                            <div className="viewer-stale-banner">
+                              <AlertTriangle size={13} /> Stale — last frame {hudFrame.last_frame_age_ms != null ? `${(hudFrame.last_frame_age_ms / 1000).toFixed(1)}s` : "some"} ago
+                            </div>
+                          )}
                           <div className="viewer-hud">
                             <span>Vehicles<strong>{hudFrame.vehicle_count ?? "—"}</strong></span>
                             <span>Bays<strong>{hudFrame.total ? `${hudFrame.occupied ?? 0}/${hudFrame.total}` : "—"}</strong></span>
@@ -816,7 +929,7 @@ export default function HomePage() {
                     <PanelHeader eyebrow="CLICK TO DRAW" title="Stream polygon editor" action={<span className="coordinate-chip">{streamPending.length} points</span>} />
                     {snapshot && snapshot.id === activeStream.id ? (
                       <div className="canvas-wrap">
-                        <CalibrationCanvas imageSrc={snapshot.url} spaces={activeStream.spaces} pending={streamPending} onAddPoint={point => setStreamPending(old => [...old, point])} />
+                        <CalibrationCanvas imageSrc={snapshot.url} spaces={activeStream.spaces} pending={streamPending} onAddPoint={point => addPolygonPoint(point, streamPending, next => setStreamPending(next))} />
                         <div className="canvas-guide"><span><i className="legend-dot red-dot" />Occupied</span><span><i className="legend-dot green-dot" />Free</span><span><i className="legend-dot grey-dot" />Unknown</span></div>
                       </div>
                     ) : (
@@ -954,7 +1067,7 @@ export default function HomePage() {
                 <PanelHeader eyebrow="CLICK TO DRAW" title="Bay polygon editor" action={<span className="coordinate-chip">{pendingPoints.length} points</span>} />
                 {selected?.preview_url ? (
                   <div className="canvas-wrap">
-                    <CalibrationCanvas imageSrc={`${API}${selected.preview_url}`} spaces={spaces} pending={pendingPoints} onAddPoint={p => updatePending(old => [...old, p])} />
+                    <CalibrationCanvas imageSrc={`${API}${selected.preview_url}`} spaces={spaces} pending={pendingPoints} onAddPoint={p => addPolygonPoint(p, pendingPoints, next => updatePending(() => next))} />
                     <div className="canvas-guide"><span><i className="legend-dot red-dot" />Occupied</span><span><i className="legend-dot green-dot" />Free</span><span><i className="legend-dot grey-dot" />Unknown</span></div>
                   </div>
                 ) : (
@@ -1122,10 +1235,18 @@ export default function HomePage() {
                 <section className="panel">
                   <PanelHeader eyebrow="EVENT DELIVERY" title="Webhooks" />
                   <div className="field-group"><label htmlFor="hook-url">ENDPOINT URL</label><input id="hook-url" type="url" placeholder="https://example.com/hooks/parkwise" value={intDraftLive.webhookUrl} onChange={e => patchInt({ webhookUrl: e.target.value })} /></div>
-                  <div className="field-group"><label htmlFor="hook-secret">SIGNING SECRET</label><input id="hook-secret" type="password" placeholder="optional · HMAC-SHA256" value={intDraftLive.webhookSecret} onChange={e => patchInt({ webhookSecret: e.target.value })} /></div>
-                  <p className="small-note">Events: video.completed, video.failed, stream.overcrowding. Headers: X-Parkwise-Event and X-Parkwise-Signature (hex HMAC-SHA256 of the body).</p>
+                  <div className="field-group">
+                    <label htmlFor="hook-secret">SIGNING SECRET</label>
+                    <input id="hook-secret" type="password" placeholder={webhookSecretConfigured ? "configured · enter a new value to replace" : "optional · HMAC-SHA256"} value={intDraftLive.webhookSecret} onChange={e => patchInt({ webhookSecret: e.target.value })} autoComplete="new-password" />
+                    <small className="field-hint">
+                      {webhookSecretConfigured
+                        ? "A signing secret is configured. The value is never displayed; typing a new value replaces it."
+                        : "No signing secret configured yet."}
+                    </small>
+                  </div>
+                  <p className="small-note">Events: video.completed, video.failed, stream.overcrowding. Headers: X-Parkwise-Event and X-Parkwise-Signature (hex HMAC-SHA256 of the body). Redirects are not followed.</p>
                   <div className="draw-actions">
-                    <button className="btn btn-primary small" onClick={() => saveSettingsPatch({ webhook_url: intDraftLive.webhookUrl, webhook_secret: intDraftLive.webhookSecret }, "Webhook settings saved.")}><Check size={14} /> Save webhook</button>
+                    <button className="btn btn-primary small" onClick={saveWebhook}><Check size={14} /> Save webhook</button>
                     <button className="btn btn-secondary small" onClick={testWebhook} disabled={webhookResult === "Sending test event…"}>{webhookResult === "Sending test event…" ? <LoaderCircle className="spin" size={14} /> : <Send size={14} />} Send test event</button>
                   </div>
                   {webhookResult && <div className="key-callout mono"><code>{webhookResult}</code></div>}
@@ -1165,6 +1286,18 @@ export default function HomePage() {
 
             {settingsTab === "users" && <>
               <section className="panel">
+                <PanelHeader eyebrow="THIS BROWSER SESSION" title="API key access"
+                  action={<span className={`status-pill ${sessionKeyActive ? "success" : "neutral"}`}><span className="status-dot" />{sessionKeyActive ? "Key active for this tab" : "No session key"}</span>} />
+                <p className="small-note">When the deployment runs with <code>PARKWISE_AUTH_REQUIRED=true</code> (or you want to act as a specific user), paste an API key below. It is kept in <b>sessionStorage only</b> — it disappears when this tab closes and is never sent anywhere except this API.</p>
+                <div className="draw-actions">
+                  <div className="field-group grow-field"><label htmlFor="session-key">API KEY (pk_…)</label>
+                    <input id="session-key" type="password" autoComplete="off" placeholder={sessionKeyActive ? "•••••••• — a key is active" : "pk_…"} value={sessionKeyInput} onChange={e => setSessionKeyInput(e.target.value)} />
+                  </div>
+                  <button className="btn btn-primary small" onClick={applySessionKey} disabled={!sessionKeyInput.trim() && !sessionKeyActive}><KeyRound size={14} /> {sessionKeyActive ? "Replace / clear" : "Use key"}</button>
+                  {sessionKeyActive && <button className="btn btn-ghost small" onClick={() => { setSessionApiKey(""); setSessionKeyActive(false); setMessage({ tone: "info", text: "Session API key cleared." }); }}>Clear</button>}
+                </div>
+              </section>
+              <section className="panel">
                 <PanelHeader eyebrow="ACCESS CONTROL" title="Users & API keys" action={<span className="muted-count">{users.length} accounts</span>} />
                 {plainKey && (
                   <div className="key-callout">
@@ -1183,7 +1316,9 @@ export default function HomePage() {
                   </div>
                   <button className="btn btn-primary" type="submit"><Plus size={15} /> Create user</button>
                 </form>
-                {users.length ? (
+                {usersError ? (
+                  <div className="list-empty"><ShieldCheck size={24} /><strong>Accounts are not visible to this session</strong><span>{usersError}</span></div>
+                ) : users.length ? (
                   <div className="table-scroll">
                     <table className="data-table">
                       <thead><tr><th>Username</th><th>Display name</th><th>Role</th><th>Status</th><th>API key</th><th>Created</th><th>Actions</th></tr></thead>
@@ -1212,11 +1347,12 @@ export default function HomePage() {
                 ) : (
                   <div className="list-empty"><Users size={24} /><strong>No additional users</strong><span>Create operator or viewer accounts; each receives an API key shown once.</span></div>
                 )}
-                <div className="table-note"><ShieldCheck size={14} /> Keys authenticate as <b>Authorization: Bearer pk_…</b> on REST calls and <b>?key=</b> on the frame WebSocket. Enforcement only applies when PARKWISE_AUTH_REQUIRED=true; the last active admin cannot be removed.</div>
+                <div className="table-note"><ShieldCheck size={14} /> Keys authenticate as <b>Authorization: Bearer pk_…</b> or <b>X-API-Key</b> on REST calls. Frame WebSockets use short-lived single-use tickets (never <b>?key=</b>). Role enforcement applies whenever a key is presented; with PARKWISE_AUTH_REQUIRED=true every request needs one. The last active admin cannot be removed.</div>
               </section>
             </>}
 
             {settingsTab === "billing" && <>
+              <div className="system-callout"><ShieldCheck size={16} /><span><b>Local plan simulation.</b> {billingReport?.billing_note || "Plan limits are enforced locally for this self-hosted pilot. No payment processor is connected and no charges are made — listed prices are illustrative only."}</span></div>
               <div className="plans-grid">
                 {settingsPayload && Object.entries(settingsPayload.plans).map(([key, plan]) => (
                   <div className={`plan-card ${billingReport?.plan === key ? "active" : ""}`} key={key}>
@@ -1304,11 +1440,22 @@ export default function HomePage() {
 }
 
 function streamRunningLabel(stream: StreamRow) {
-  if (stream.running || stream.status === "live") return "Live";
+  const isReplay = stream.kind === "video" || stream.source_mode === "replay";
+  if (stream.running || stream.status === "live") return isReplay ? "Replay" : "Live";
+  if (stream.status === "reconnecting") return "Reconnecting";
   if (stream.status === "error") return "Error";
   if (stream.status === "starting") return "Starting";
   if (stream.last_error) return "Blocked";
   return "Idle";
+}
+
+function streamStatusTone(stream: StreamRow): string {
+  const label = streamRunningLabel(stream);
+  if (label === "Live") return "success";
+  if (label === "Replay") return "info";
+  if (label === "Error" || label === "Blocked") return "danger";
+  if (label === "Reconnecting" || label === "Starting") return "warning";
+  return "neutral";
 }
 
 function occupancyRowsFor(points: OccupancyPoint[]) {

@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import "maplibre-gl/dist/maplibre-gl.css";
 import type { Map as MaplibreMap, Marker as MaplibreMarker } from "maplibre-gl";
 
-export type MapSite = { id: string; name: string; lat: number; lon: number; status: string };
+type MapSite = { id: string; name: string; lat: number; lon: number; status: string };
 
 const DEFAULT_STYLE = "https://demotiles.maplibre.org/style.json";
 
@@ -35,8 +35,10 @@ export default function SiteMap({ sites, center, styleUrl }: { sites: MapSite[];
         const map = new lib.Map({
           container: holder.current,
           style: styleUrl || DEFAULT_STYLE,
-          center: [center?.[1] ?? 12.4, center?.[0] ?? 41.9],
-          zoom: 2,
+          // No configured centre means a neutral world view — never a guessed
+          // facility location. Markers fitBounds to real coordinates below.
+          center: center ? [center[1], center[0]] : [0, 15],
+          zoom: center ? 11 : 1.4,
           attributionControl: { compact: true },
         });
         map.on("error", (event) => {
@@ -69,11 +71,23 @@ export default function SiteMap({ sites, center, styleUrl }: { sites: MapSite[];
     const placed = sites.filter((site) => Number.isFinite(site.lat) && Number.isFinite(site.lon));
     for (const site of placed) {
       const el = document.createElement("div");
-      el.className = `map-marker ${site.status === "live" ? "live" : ""}`;
+      el.className = `map-marker ${site.status.toLowerCase() === "live" ? "live" : ""}`;
       el.title = `${site.name} (${site.status})`;
+
+      // Popup content is built with DOM nodes + textContent only — a stream or
+      // site name containing HTML/script must render as inert text (XSS guard).
+      const popupContent = document.createElement("div");
+      const nameEl = document.createElement("strong");
+      nameEl.textContent = site.name;
+      const statusEl = document.createElement("div");
+      statusEl.textContent = site.status;
+
+      popupContent.appendChild(nameEl);
+      popupContent.appendChild(statusEl);
+      
       const marker = new lib.Marker({ element: el, anchor: "bottom" })
         .setLngLat([site.lon, site.lat])
-        .setPopup(new lib.Popup({ offset: 24 }).setHTML(`<strong>${site.name}</strong><br>${site.status}`))
+        .setPopup(new lib.Popup({ offset: 24 }).setDOMContent(popupContent))
         .addTo(map);
       markerRefs.current.push(marker);
     }

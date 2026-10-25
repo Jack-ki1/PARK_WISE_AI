@@ -26,6 +26,8 @@ export type Summary = {
 };
 
 export type Space = { id: string; video_id: string; name: string; polygon: number[][]; state: string; confidence: number | null; last_seen_seconds: number | null };
+/** Backend limit on polygon vertices (SpaceCreate / StreamSpace max_length). */
+export const MAX_POLYGON_POINTS = 30;
 export type Point = { timestamp_seconds: number; frame_number: number; vehicle_count: number; tracked_vehicle_count: number; mean_confidence: number | null };
 export type OccupancyPoint = { space_id: string; space_name: string; timestamp_seconds: number; state: string; confidence: number | null };
 export type OccupancySeries = { items: OccupancyPoint[] };
@@ -69,9 +71,11 @@ export type ActivityItem = {
 export type StreamSpace = { name: string; polygon: number[][] };
 
 export type StreamRow = {
-  id: string; name: string; kind: string; url: string | null; video_id: string | null; video_name: string | null;
-  enabled: boolean; status: string; last_error: string | null; target_fps: number; running: boolean;
-  subscriber_count: number; frames_delivered: number; last_frame_at: string | null; lat: number | null;
+  id: string; name: string; kind: string; source_mode?: string; url: string | null;
+  video_id: string | null; video_name: string | null;
+  enabled: boolean; status: string; stale?: boolean; last_error: string | null; target_fps: number; running: boolean;
+  subscriber_count: number; frames_delivered: number; last_frame_at: string | null; last_frame_age_seconds?: number | null;
+  lat: number | null;
   lon: number | null; spaces: StreamSpace[]; space_count: number; snapshot_url: string | null; created_at: string | null;
 };
 
@@ -80,6 +84,7 @@ export type LiveFrame = {
   tracked?: number; mean_confidence?: number | null; bays?: { name: string; state: string; confidence: number }[];
   occupied?: number; total?: number; events?: LiveEvent[]; inference_fps?: number; latency_ms?: number; model?: string;
   status?: string; error?: string | null; detail?: string;
+  source_mode?: string; last_frame_age_ms?: number; stale?: boolean;
 };
 
 export type LiveEvent = { type: string; ts?: string; bay?: string; from?: string; to?: string; direction?: string; track_id?: number; occupied?: number; total?: number };
@@ -95,6 +100,7 @@ export type PlanInfo = { name: string; price_month_usd: number; blurb: string; l
 
 export type BillingReport = {
   plan: string; plan_info: PlanInfo; month: string; videos_total: number;
+  billing_mode?: string; billing_note?: string;
   usage: Record<string, number>;
   meters: { label: string; used: number; limit: number; key: string; percent: number; exceeded: boolean }[];
 };
@@ -117,11 +123,104 @@ export type SystemInfo = {
 export const API = (process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000").replace(/\/$/, "");
 export const WS_BASE = API.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
 
+/* Session-scoped API key access (Users & Access tab).
+
+   The key lives in sessionStorage only — it is cleared when the browser tab
+   closes and is never written to localStorage or a cookie. Long-lived storage
+   of operator keys in the browser is deliberately not supported. */
+const API_KEY_SESSION = "parkwise-session-api-key";
+
+export class ApiAuthError extends Error {
+  readonly status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiAuthError";
+    this.status = status;
+  }
+}
+
+export function getApiKey(): string | null {
+  if (typeof window === "undefined") return null;
+  try { return window.sessionStorage.getItem(API_KEY_SESSION); } catch { return null; }
+}
+
+export function setSessionApiKey(key: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (key) window.sessionStorage.setItem(API_KEY_SESSION, key);
+    else window.sessionStorage.removeItem(API_KEY_SESSION);
+  } catch { /* storage may be unavailable (private mode) */ }
+}
+
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API}${path}`, { ...init, cache: "no-store" });
+  const headers = new Headers(init?.headers);
+  const key = getApiKey();
+  if (key && !headers.has("X-API-Key")) headers.set("X-API-Key", key);
+  const response = await fetch(`${API}${path}`, { ...init, headers, cache: "no-store" });
   const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(typeof payload.detail === "string" ? payload.detail : `Request failed (${response.status})`);
+  if (!response.ok) {
+    if (response.status === 401) {
+      throw new ApiAuthError(
+        typeof payload.detail === "string" ? payload.detail : "Authentication required — add your API key under Reports & Settings → Users & Access.",
+        401,
+      );
+    }
+    if (response.status === 403) {
+      throw new ApiAuthError(
+        typeof payload.detail === "string" ? payload.detail : "Your account does not have access to this resource (403).",
+        403,
+      );
+    }
+    throw new Error(typeof payload.detail === "string" ? payload.detail : `Request failed (${response.status})`);
+  }
   return payload as T;
+}
+
+/** Exchange the session API key for a short-lived, single-use WebSocket ticket.
+ *  Durable credentials are never placed in a WebSocket URL. */
+export async function requestStreamTicket(streamId: string): Promise<string> {
+  const data = await api<{ ticket: string; expires_in_seconds: number }>(
+    `/api/streams/${streamId}/ws-ticket`,
+    { method: "POST" },
+  );
+  return data.ticket;
+}
+
+/** Build the job-progress WebSocket URL, exchanging a one-use ticket when the
+ *  deployment requires auth or a session key is present (browsers cannot attach
+ *  an API-key header to a WebSocket handshake). */
+export async function videoSocketUrl(videoId: string): Promise<string> {
+  const base = `${WS_BASE}/api/ws/videos/${videoId}`;
+  if (typeof window === "undefined") return base;
+  try {
+    const publicConfig = await api<{ auth_required: boolean }>("/api/config/public").catch(() => null);
+    if (publicConfig?.auth_required || getApiKey()) {
+      const data = await api<{ ticket: string }>(`/api/videos/${videoId}/ws-ticket`, { method: "POST" });
+      return `${base}?ticket=${encodeURIComponent(data.ticket)}`;
+    }
+  } catch (err) {
+    if (err instanceof ApiAuthError) throw err;
+    // Anonymous mode: connect without a ticket.
+  }
+  return base;
+}
+
+/** Build the authenticated frame-WebSocket URL for a stream (via a one-use ticket
+ *  whenever the deployment requires auth or a session key is present). */
+export async function streamSocketUrl(streamId: string): Promise<string> {
+  const base = `${WS_BASE}/api/ws/streams/${streamId}`;
+  if (typeof window === "undefined") return base;
+  try {
+    const publicConfig = await api<{ auth_required: boolean }>("/api/config/public").catch(() => null);
+    if (publicConfig?.auth_required || getApiKey()) {
+      const ticket = await requestStreamTicket(streamId);
+      return `${base}?ticket=${encodeURIComponent(ticket)}`;
+    }
+  } catch (err) {
+    if (err instanceof ApiAuthError) throw err;
+    // Anonymous mode: connect without a ticket.
+  }
+  return base;
 }
 
 /* -------------------------------------------------------------- formatters */

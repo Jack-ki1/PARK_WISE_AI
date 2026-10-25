@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef } from "react";
 import type { MouseEvent, ReactNode } from "react";
 import type { LucideIcon } from "lucide-react";
 import { ArrowRight, Database, FileVideo, LoaderCircle, Play, Trash2 } from "lucide-react";
-import { API, fmtDuration, fmtNum, statusClass, statusLabel, type VideoJob } from "@/lib/data";
+import { fmtDuration, fmtNum, statusClass, statusLabel, type VideoJob } from "@/lib/data";
 
 export function MetricCard({ title, value, detail, icon: Icon, accent, mini }: { title: string; value: string; detail: string; icon: LucideIcon; accent: string; mini: ReactNode }) {
   return (
@@ -18,10 +18,6 @@ export function MetricCard({ title, value, detail, icon: Icon, accent, mini }: {
 
 export function PanelHeader({ eyebrow, title, action }: { eyebrow: string; title: string; action?: ReactNode }) {
   return <div className="panel-header"><div><div className="panel-eyebrow">{eyebrow}</div><h2>{title}</h2></div>{action}</div>;
-}
-
-export function StatLine({ label, value }: { label: string; value: string }) {
-  return <div className="stat-line"><span>{label}</span><strong>{value}</strong></div>;
 }
 
 export function Fact({ label, value }: { label: string; value: string }) {
@@ -142,20 +138,3 @@ export function CalibrationCanvas({ imageSrc, spaces, pending, onAddPoint }: { i
   };
   return <canvas className="calibration-canvas" ref={canvasRef} onClick={handleClick} aria-label="Click around a parking bay to draw its polygon" />;
 }
-
-export function ProgressRing({ percent, label }: { percent: number; label: string }) {
-  const radius = 26, circumference = 2 * Math.PI * radius;
-  const value = Math.max(0, Math.min(100, percent));
-  return (
-    <div className="progress-ring" role="img" aria-label={`${label}: ${value.toFixed(0)}%`}>
-      <svg viewBox="0 0 64 64">
-        <circle cx="32" cy="32" r={radius} fill="none" stroke="var(--pw-chart-grid)" strokeWidth="7" />
-        <circle cx="32" cy="32" r={radius} fill="none" stroke="var(--pw-series-1)" strokeWidth="7" strokeLinecap="round"
-          strokeDasharray={`${(value / 100) * circumference} ${circumference}`} transform="rotate(-90 32 32)" />
-      </svg>
-      <strong>{value.toFixed(0)}%</strong>
-    </div>
-  );
-}
-
-export function previewSrc(path: string | null) { return path ? `${API}${path}` : null; }
