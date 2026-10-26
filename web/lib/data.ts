@@ -139,6 +139,25 @@ export class ApiAuthError extends Error {
   }
 }
 
+/** The request never produced an HTTP response: API down, wrong URL, DNS,
+ *  CORS rejection or a timeout. Distinct from a 4xx/5xx so the UI can say
+ *  *why* it is offline instead of a bare "Failed to fetch". */
+export class ApiUnreachableError extends Error {
+  constructor(readonly apiBase: string, readonly cause?: unknown) {
+    super(
+      `Cannot reach the API at ${apiBase}. Start the backend ` +
+        `(.venv/bin/python3 -m uvicorn app.main:app --app-dir backend) and confirm ` +
+        `NEXT_PUBLIC_API_BASE_URL matches the host and port it prints.`,
+    );
+    this.name = "ApiUnreachableError";
+  }
+}
+
+/** Health/polling GETs that hang (a stalled API, a dropped VPN, a half-open
+ *  socket) would otherwise leave the dashboard spinning on stale data forever.
+ *  A 502 no longer appears: the request is aborted and reported as unreachable. */
+const REQUEST_TIMEOUT_MS = 15000;
+
 export function getApiKey(): string | null {
   if (typeof window === "undefined") return null;
   try { return window.sessionStorage.getItem(API_KEY_SESSION); } catch { return null; }
@@ -156,12 +175,26 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   const key = getApiKey();
   if (key && !headers.has("X-API-Key")) headers.set("X-API-Key", key);
-  const response = await fetch(`${API}${path}`, { ...init, headers, cache: "no-store" });
+  const controller = new AbortController();
+  const callerSignal = init?.signal;
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const onCallerAbort = () => controller.abort();
+  callerSignal?.addEventListener("abort", onCallerAbort, { once: true });
+  let response: Response;
+  try {
+    response = await fetch(`${API}${path}`, { ...init, headers, cache: "no-store", signal: controller.signal });
+  } catch (err) {
+    if (callerSignal?.aborted) throw err; // caller cancelled deliberately
+    throw new ApiUnreachableError(API, err);
+  } finally {
+    clearTimeout(timeout);
+    callerSignal?.removeEventListener("abort", onCallerAbort);
+  }
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
     if (response.status === 401) {
       throw new ApiAuthError(
-        typeof payload.detail === "string" ? payload.detail : "Authentication required — add your API key under Reports & Settings → Users & Access.",
+        typeof payload.detail === "string" ? payload.detail : "Authentication required — add your API key under Settings → Users.",
         401,
       );
     }
@@ -174,6 +207,26 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
     throw new Error(typeof payload.detail === "string" ? payload.detail : `Request failed (${response.status})`);
   }
   return payload as T;
+}
+
+/** Fetch a protected media file as a blob and save it via a temporary anchor.
+ *  Plain `<a href>` downloads cannot carry the X-API-Key header, so large
+ *  artifacts (annotated videos) go through an authenticated fetch first. */
+export async function downloadFile(path: string, filename: string): Promise<void> {
+  const headers = new Headers();
+  const key = getApiKey();
+  if (key) headers.set("X-API-Key", key);
+  const response = await fetch(`${API}${path}`, { headers, cache: "no-store" });
+  if (!response.ok) throw new Error(`Download failed (${response.status})`);
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
 }
 
 /** Exchange the session API key for a short-lived, single-use WebSocket ticket.

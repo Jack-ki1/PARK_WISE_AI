@@ -9,7 +9,7 @@
 - [x] YOLO vehicle detection + ByteTrack on sampled video frames.
 - [x] User-drawn parking-bay polygons, temporal smoothing and per-space measurements.
 - [x] Annotated output, confidence and vehicle-count samples, job progress and failure state.
-- [x] Next.js dashboard, Video Lab, calibration editor, analytics view and job events.
+- [x] Next.js dashboard (Dashboard / Live View / Reports & Settings), calibration editors for videos and streams, analytics views and activity/event logs.
 - [x] REST and WebSocket interfaces, Docker Compose and tests.
 
 ### Acceptance checks
@@ -24,7 +24,9 @@
 
 ## Release 2 — site pilot hardening (recommended next)
 
-1. Add login, role-based access control, per-site ownership and an audit log.
+1. Add interactive login/SSO and per-site ownership. (API-key auth with `admin`/`operator`/`viewer`
+   roles, rate limiting and an activity/audit log are delivered; the remaining gap is a user-facing
+   login session and multi-site scoping.)
 2. Replace FastAPI in-process background processing with a durable worker queue.
 3. Add database migrations, PostgreSQL, object storage and retention jobs.
 4. Build labelled ground-truth test sets by camera/site/time period; set acceptance thresholds for occupancy and false-free rate.
@@ -33,8 +35,11 @@
 
 ## Release 3 — live cameras and multi-site operations
 
-1. Add a hardened RTSP/ONVIF camera adapter and secure network-egress policy.
-2. Implement reconnect, backoff, offline buffering, frame-drop metrics and per-camera workers.
+1. Harden the camera adapter beyond URL/RTSP support (ONVIF discovery, credential storage) and
+   formalize the network-egress policy. (URL streams with SSRF guards, trusted CIDRs and
+   reconnect/backoff are delivered; camera credentials are deliberately not stored.)
+2. Add offline buffering, frame-drop metrics and per-camera worker processes. (Reconnect with capped
+   exponential backoff and per-stream model instances are delivered.)
 3. Use GPU/edge inference with device-specific benchmarking; export to TensorRT only after equivalence tests.
 4. Add zone/lane geometry, entry/exit line crossing, blockage rules, and camera-to-layout calibration versioning.
 5. Roll out to a limited site in shadow mode with an operator checking availability before driver-facing use.

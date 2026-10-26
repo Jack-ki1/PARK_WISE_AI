@@ -30,3 +30,14 @@ models/*
 .DS_Store
 *.pt
 *.onnx
+# TypeScript build artifacts
+*.tsbuildinfo
+web/tsconfig.tsbuildinfo
+# pytest media scratch dir (see backend/tests/conftest.py)
+.test-data/
+
+# Playwright test artifacts
+playwright-report/
+test-results/
+*.png
+!docs/*.png

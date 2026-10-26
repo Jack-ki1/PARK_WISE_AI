@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import HTTPException
@@ -23,7 +23,7 @@ def _month_start() -> datetime:
 def storage_bytes(db: Session) -> int:
     root = Path(env_settings.data_dir).expanduser().resolve()
     total = 0
-    for folder in ("uploads", "processed", "previews"):
+    for folder in ("uploads", "processed", "previews", "streams"):
         base = root / folder
         if not base.exists():
             continue
@@ -84,6 +84,12 @@ def billing_report(db: Session) -> dict:
     return {
         "plan": plan_name,
         "plan_info": plan,
+        # Honest labelling: no payment processor is connected in this build.
+        "billing_mode": "local_simulation",
+        "billing_note": (
+            "Illustrative local plan configuration for a self-hosted pilot. "
+            "No payment processor is connected and no charges are made."
+        ),
         "usage": {
             **used,
             "storage_gb": round(storage_gb, 2),

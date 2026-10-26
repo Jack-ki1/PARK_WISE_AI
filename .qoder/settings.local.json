@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find . -type f \\\\\\( -name \"*.py\" -o -name \"*.tsx\" -o -name \"*.ts\" -o -name \"*.md\" -o -name \"*.toml\" -o -name \"*.json\" -o -name \"*.sh\" \\\\\\) -not -path \"*/node_modules/*\" -not -path \"*/.git/*\" -not -path \"*/.next/*\" -not -path \"*/__pycache__/*\" -not -path \"*/venv/*\" -not -path \"*/.venv/*\" | head -100)",
+      "Bash(wc -l $\\(find . -type f \\\\\\( -name \"*.py\" -o -name \"*.tsx\" -o -name \"*.ts\" \\\\\\) -not -path \"*/node_modules/*\" -not -path \"*/.next/*\" -not -path \"*/__pycache__/*\" -not -path \"*/.venv/*\" -not -path \"*/venv/*\" -not -name \"next-env.d.ts\"\\) | sort -n | tail -40)",
+      "Bash(find /home/jackson11/projects/data/PARKWISE_AI/web -type f -not -path \"*/node_modules/*\" -not -path \"*/.next/*\" | head -50)",
+      "Bash(cd /home/jackson11/projects/data/PARKWISE_AI && git status --short | head -60 && echo --- && git log --oneline -5)",
+      "Bash(head -100 backend/tests/test_security.py; echo ====; head -60 backend/tests/test_startup_security.py; echo ====; cat backend/tests/conftest.py)",
+      "Bash(head -40 /home/jackson11/projects/data/PARKWISE_AI/web/app/globals.css; wc -l /home/jackson11/projects/data/PARKWISE_AI/web/app/globals.css; grep -n \"tailwind\\\\|@import\\\\|@theme\" /home/jackson11/projects/data/PARKWISE_AI/web/app/globals.css | head; grep -n \"dangerouslySetInnerHTML\\\\|localStorage\\\\|sessionStorage\\\\|as any\\\\|: any\\\\|as unknown\" -r /home/jackson11/projects/data/PARKWISE_AI/web/app /home/jackson11/projects/data/PARKWISE_AI/web/components /home/jackson11/projects/data/PARKWISE_AI/web/lib; cat /home/jackson11/projects/data/PARKWISE_AI/web/.env.local 2>/dev/null | head -5)",
+      "Bash(cd /home/jackson11/projects/data/PARKWISE_AI && cat scripts/run_local.sh)",
+      "Bash(cd /home/jackson11/projects/data/PARKWISE_AI && sed -n '70,120p' backend/app/config.py; echo ===MARKERS===; ls backend/pytest.ini backend/pyproject.toml pytest.ini pyproject.toml setup.cfg 2>/dev/null; grep -rn \"slow\\\\|@pytest.mark\" backend/tests | head; grep -n \"addopts\\\\|markers\\\\|testpaths\" backend/pytest.ini pyproject.toml 2>/dev/null)",
+      "Bash(cd /home/jackson11/projects/data/PARKWISE_AI && grep -rn \"@router\\\\.\\\\\\(get\\\\|post\\\\|put\\\\|delete\\\\|patch\\\\|websocket\\\\\\)\" backend/app/api | sed 's/:.*@/ @/' ; echo ===API_MD===; grep -nE \"GET |POST |PUT |DELETE |PATCH |WS |wss\" docs/API.md | head -80)",
+      "Bash(cd /home/jackson11/projects/data/PARKWISE_AI && for m in billing integrations activity public_sources settings_store video_pipeline ssrf validate_safe; do echo \"--$m--\"; grep -rln \"$m\" backend/tests --include='*.py'; done; echo ===REQTEST===; cat backend/requirements-test.txt; echo ===REQDEV===; cat backend/requirements-dev.txt)",
+      "Bash(cd /home/jackson11/projects/data/PARKWISE_AI && grep -rln \"_merge_vehicle_boxes\\\\|_space_states\\\\|_scale_candidates\\\\|inspect_video\\\\|process_video_job\\\\|_detect_pass\" backend/tests; echo ===; grep -n \"cov\\\\|addopts\" -r backend/tests backend/pytest.ini .github/workflows/ci.yml 2>/dev/null | head -5; echo ===STALE===; grep -n \"CodeQL\\\\|npm ci\\\\|actions/\" docs/BUILD_STATUS.md | head; grep -n \"check_project\\\\|run_local\" docs/DEPLOYMENT.md | head -6)",
+      "Bash(sed -n 34/54p /dev/null; sed -n '34,56p;340,360p;505,545p' backend/app/services/live_stream.py)",
+      "Read(//dev/**)",
+      "Bash(grep -n \"point_in_polygon\\\\|class BayTracker\\\\|def update\\\\|def _state\\\\|width\\\\|height\" backend/app/services/live_stream.py | sed -n '1,40p'; echo ===; sed -n '/class BayTracker/,/def summary/p' backend/app/services/live_stream.py | head -60)"
+    ]
+  }
+}

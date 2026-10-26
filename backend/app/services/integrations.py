@@ -17,6 +17,20 @@ from . import settings_store
 ALLOWED_EVENTS = {"video.completed", "video.failed", "stream.overcrowding"}
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects so a validated public URL cannot bounce us to a
+    forbidden address (metadata services, internal hosts). Operators must
+    configure the final webhook URL directly."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        raise urllib.error.HTTPError(
+            req.full_url, code, "redirects are not followed; configure the final webhook URL", headers, fp
+        )
+
+
+_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+
+
 def dispatch(db: Session, event: str, payload: dict) -> dict:
     """Best-effort POST to the configured webhook (SSRF-validated, 5s timeout, signed).
 
@@ -49,7 +63,7 @@ def dispatch(db: Session, event: str, payload: dict) -> dict:
 
     request = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=5) as response:  # noqa: S310 - URL validated
+        with _OPENER.open(request, timeout=5) as response:  # noqa: S310 - URL validated, no redirects
             return {"delivered": response.status < 300, "status": response.status}
     except urllib.error.HTTPError as exc:
         return {"delivered": False, "status": exc.code, "error": str(exc)[:200]}

@@ -15,6 +15,7 @@ Design notes
 from __future__ import annotations
 
 import json
+import random
 import threading
 import time
 from collections import deque
@@ -23,7 +24,7 @@ from typing import Any
 
 from ..config import settings as env_settings
 from ..models import Stream
-from .model_store import get_model
+from .model_store import INFERENCE_LOCK, drop_stream_models, get_stream_model
 
 VEHICLE_CLASSES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 OVERCROWDING_RATIO = 0.8
@@ -59,7 +60,7 @@ class BayTracker:
     def __init__(self, spaces: list[dict]) -> None:
         self.names = [str(space.get("name") or f"Bay {i + 1}") for i, space in enumerate(spaces)]
         self.polygons = [space.get("polygon") or [] for space in spaces]
-        self.votes: list[deque[str]] = [deque(maxlen=4) for _ in spaces]
+        self.votes: list[deque[str]] = [deque(maxlen=5) for _ in spaces]  # same window as video_pipeline
         self.states: list[str] = ["unknown"] * len(spaces)
         self.confidences: list[float] = [0.0] * len(spaces)
 
@@ -135,6 +136,9 @@ class StreamSession:
         self.stream_id = stream.id
         self.source = source
         self.kind = stream.kind
+        # "live_camera" for RTSP/HTTP camera URLs; "replay" for uploaded video loops.
+        # The UI must label replay sources as RECORDED/REPLAY, never camera LIVE.
+        self.source_mode = "replay" if stream.kind == "video" else "live_camera"
         self.spaces = spaces
         self.inference = inference
         self.target_fps = max(1, min(int(stream.target_fps or 4), 15))
@@ -143,6 +147,11 @@ class StreamSession:
         self.subscribers = 0
         self.frames_delivered = 0
         self.started_at = time.monotonic()
+        self.last_frame_monotonic: float | None = None
+        self.reconnect_attempts = 0
+        # True when an operator started it via POST /start (viewer-started sessions
+        # are stopped again by stop_if_idle once the last viewer disconnects).
+        self.explicitly_started = False
         self.stop_event = threading.Event()
         self._lock = threading.Lock()
         self._seq = 0
@@ -166,6 +175,17 @@ class StreamSession:
     def alive(self) -> bool:
         return bool(self._thread and self._thread.is_alive() and not self.stop_event.is_set())
 
+    def frame_age_seconds(self) -> float | None:
+        if self.last_frame_monotonic is None:
+            return None
+        return round(time.monotonic() - self.last_frame_monotonic, 3)
+
+    def is_stale(self) -> bool:
+        age = self.frame_age_seconds()
+        if age is None:
+            return self.status in {"live", "reconnecting"}
+        return age > env_settings.stream_stale_seconds
+
     def add_subscriber(self) -> int:
         with self._lock:
             self.subscribers += 1
@@ -186,6 +206,13 @@ class StreamSession:
 
     # -- worker ------------------------------------------------------------
     def _run(self) -> None:
+        """Open the source with bounded reconnects + exponential backoff (camera URLs only).
+
+        Video-backed replay sources fail immediately (a missing file will not
+        appear by retrying). Camera URLs retry with jittered exponential backoff
+        up to PARKWISE_STREAM_MAX_RECONNECT_ATTEMPTS, surfacing status
+        "reconnecting" between attempts and a terminal "error" when exhausted.
+        """
         try:
             import cv2  # noqa: F401  (imported here so unit tests can import this module)
         except ModuleNotFoundError as exc:  # pragma: no cover - guarded in video_pipeline too
@@ -194,29 +221,91 @@ class StreamSession:
 
         import cv2
 
-        self._set_status("live")
-        capture = cv2.VideoCapture(self.source)
-        if not capture.isOpened():
-            self._fail("Could not open the source (connection refused or unsupported URL).")
-            return
+        max_attempts = max(0, int(env_settings.stream_max_reconnect_attempts))
+        while not self.stop_event.is_set():
+            self._set_status("live" if self.reconnect_attempts == 0 else "reconnecting")
+            capture = cv2.VideoCapture(self.source)
+            if not capture.isOpened():
+                capture.release()
+                self.reconnect_attempts += 1
+                if self.kind != "url" or self.reconnect_attempts > max_attempts:
+                    self._fail(
+                        "Could not open the source (connection refused or unsupported URL)"
+                        + (f" after {self.reconnect_attempts} attempts." if self.reconnect_attempts > 1 else ".")
+                    )
+                    return
+                self.last_error = (
+                    f"Could not open the source (attempt {self.reconnect_attempts}/{max_attempts}); retrying."
+                )
+                self._set_status("reconnecting")
+                if self.stop_event.wait(self._backoff_delay(self.reconnect_attempts)):
+                    return
+                continue
 
-        try:
-            self._loop(capture, cv2)
-        except Exception as exc:  # pragma: no cover - defensive: keep the manager in control
-            self._fail(f"{type(exc).__name__}: {exc}")
-        finally:
-            capture.release()
-            if self.status == "live":
-                self._set_status("idle")
+            try:
+                finished = self._loop(capture, cv2)
+            except Exception as exc:  # pragma: no cover - defensive: keep the manager in control
+                capture.release()
+                self.reconnect_attempts += 1
+                if self.kind != "url" or self.reconnect_attempts > max_attempts:
+                    self._fail(
+                        f"{type(exc).__name__}: {exc}"
+                        + (f" (gave up after {self.reconnect_attempts} attempts)" if self.reconnect_attempts > 1 else "")
+                    )
+                    return
+                self.last_error = f"{type(exc).__name__}: {exc} (attempt {self.reconnect_attempts}/{max_attempts}); retrying."
+                self._set_status("reconnecting")
+                if self.stop_event.wait(self._backoff_delay(self.reconnect_attempts)):
+                    return
+                continue
+            finally:
+                capture.release()
 
-    def _loop(self, capture, cv2) -> None:
+            if finished:
+                # Clean end (replay loop ended via stop/max-seconds or camera stopped for good).
+                if self.status == "live":
+                    self._set_status("idle")
+                return
+
+            # Source dropped mid-read: reconnect for camera URLs, terminal for replay files.
+            self.reconnect_attempts += 1
+            if self.kind != "url" or self.reconnect_attempts > max_attempts:
+                if self.kind == "url":
+                    self._fail(
+                        f"Source stopped delivering frames after {self.reconnect_attempts} reconnect attempts "
+                        f"(limit {max_attempts})."
+                    )
+                else:
+                    self._fail(self.last_error or "Replay source stopped delivering frames.")
+                return
+            self.last_error = (
+                f"Source stopped delivering frames (attempt {self.reconnect_attempts}/{max_attempts}); retrying."
+            )
+            self._set_status("reconnecting")
+            if self.stop_event.wait(self._backoff_delay(self.reconnect_attempts)):
+                return
+
+    @staticmethod
+    def _backoff_delay(attempt: int) -> float:
+        """Exponential backoff with full jitter, capped at 30s."""
+        base = min(30.0, 2.0 ** attempt)
+        return base * (0.5 + random.random() / 2.0)
+
+    def _loop(self, capture, cv2) -> bool:
+        """Process frames until stop, a clean end, or source failure.
+
+        Returns True for a clean finish (stop event, replay ended on stop, or
+        stream_max_seconds reached); False when the source stopped delivering
+        frames (reconnectable for camera URLs).
+        """
         tracker = BayTracker(self.spaces)
         direction = DirectionDetector()
         roi = self._roi()
         frame_interval = 1.0 / self.target_fps
-        inference_scale = max(480, min(int(self.inference.get("image_size", 1280)), 960))
-        imgsz = int(self.inference.get("image_size", 1280))
-        imgsz = min(imgsz, inference_scale)
+        # Live view is latency-sensitive: cap the configured image size at 960 px
+        # (see settings_store.SETTING_SCHEMA note) so a 4K-sized batch setting cannot
+        # stall the interactive feed.
+        imgsz = max(480, min(int(self.inference.get("image_size", 1280)), 960))
         last_overcrowding = 0.0
         last_db_write = 0.0
         fps_ema = 0.0
@@ -226,7 +315,7 @@ class StreamSession:
         while not self.stop_event.is_set():
             if max_seconds and time.monotonic() - self.started_at > max_seconds:
                 self._set_status("idle")
-                return
+                return True
             started = time.monotonic()
             ok, frame = capture.read()
             if not ok or frame is None:
@@ -235,14 +324,21 @@ class StreamSession:
                     ok, frame = capture.read()
                 if not ok or frame is None:
                     failures += 1
-                    if self.kind != "video" and failures > 10:
-                        self._fail("Source stopped delivering frames (10 consecutive failures).")
-                        return
+                    if self.kind == "video" and failures > 10:
+                        # A replay file that stops reading is a terminal error, not a camera drop.
+                        self.last_error = "Replay source stopped delivering frames."
+                        return False
+                    if self.kind != "url" and failures > 10:
+                        self.last_error = "Source stopped delivering frames (10 consecutive failures)."
+                        return False
+                    if failures > 30:  # ~12s of silence even for a camera mid-reconnect window
+                        return False
                     time.sleep(0.4)
                     continue
             failures = 0
+            self.last_frame_monotonic = time.monotonic()
 
-            detections = self._detect(frame, imgsz, cv2)
+            detections = self._detect(frame, imgsz)
             boxes: list[dict] = []
             centers: dict[int, tuple[float, float]] = {}
             confidences: list[float] = []
@@ -265,14 +361,14 @@ class StreamSession:
             now = time.monotonic()
             if states and occupied / len(states) >= OVERCROWDING_RATIO and now - last_overcrowding > OVERCROWDING_COOLDOWN_S:
                 last_overcrowding = now
-                events.append(
-                    {
-                        "type": "overcrowding",
-                        "occupied": occupied,
-                        "total": len(states),
-                        "ts": utcnow().isoformat(),
-                    }
-                )
+                overcrowding = {
+                    "type": "overcrowding",
+                    "occupied": occupied,
+                    "total": len(states),
+                    "ts": utcnow().isoformat(),
+                }
+                events.append(overcrowding)
+                self._dispatch_overcrowding(overcrowding)
 
             annotated = self._annotate(frame, boxes, states, cv2)
             jpeg = self._encode(annotated, cv2)
@@ -282,6 +378,9 @@ class StreamSession:
             payload = {
                 "stream_id": self.stream_id,
                 "ts": utcnow().isoformat(),
+                "source_mode": self.source_mode,
+                "status": "live" if self.source_mode == "live_camera" else "replay",
+                "last_frame_age_ms": int((time.monotonic() - self.last_frame_monotonic) * 1000),
                 "vehicle_count": len(boxes),
                 "tracked": len(centers),
                 "mean_confidence": round(sum(confidences) / len(confidences), 3) if confidences else None,
@@ -312,6 +411,7 @@ class StreamSession:
             elif elapsed > 1.5 and self.target_fps > 1:  # adaptive degrade on slow hosts
                 self.target_fps = max(1, self.target_fps - 1)
                 frame_interval = 1.0 / self.target_fps
+        return True
 
     # -- helpers -----------------------------------------------------------
     def _roi(self) -> list[list[float]]:
@@ -323,26 +423,75 @@ class StreamSession:
             return []
         return [[min(xs), min(ys)], [max(xs), min(ys)], [max(xs), max(ys)], [min(xs), max(ys)]]
 
-    def _detect(self, frame, imgsz: int, cv2) -> list[tuple]:
-        """Returns (x1, y1, x2, y2, conf, class_id, track_id) in pixel coordinates."""
+    def _dispatch_overcrowding(self, event: dict) -> None:
+        """Fire the configured webhook on an overcrowding event (ALLOWED_EVENTS).
+
+        The request runs on a helper thread so a slow endpoint can never stall
+        the frame loop; the call itself is skipped when no webhook is set.
+        """
+        from ..database import SessionLocal
+        from . import settings_store
+        from .integrations import dispatch
+
+        probe = SessionLocal()
+        try:
+            configured = bool(settings_store.get(probe, "webhook_url"))
+        finally:
+            probe.close()
+        if not configured:
+            return
+        payload = {
+            "stream_id": self.stream_id,
+            "source_mode": self.source_mode,
+            "occupied": event.get("occupied"),
+            "total": event.get("total"),
+            "ts": event.get("ts"),
+        }
+
+        def _send() -> None:
+            db = SessionLocal()
+            try:
+                dispatch(db, "stream.overcrowding", payload)
+            except Exception:  # pragma: no cover - delivery must never break the feed
+                pass
+            finally:
+                db.close()
+
+        threading.Thread(target=_send, name=f"webhook-{self.stream_id}", daemon=True).start()
+
+    def _detect(self, frame, imgsz: int) -> list[tuple]:
+        """Returns (x1, y1, x2, y2, conf, class_id, track_id) in pixel coordinates.
+
+        Uses a per-stream model instance (so ByteTrack state never leaks between
+        concurrent streams) and serializes inference through INFERENCE_LOCK.
+        """
         height, width = frame.shape[:2]
-        model = get_model(self.inference.get("model", "yolo26s.pt"), self.inference.get("device", "auto"))
+        model = get_stream_model(
+            self.inference.get("model", "yolo26s.pt"),
+            self.inference.get("device", "auto"),
+            self.stream_id,
+        )
         conf = float(self.inference.get("confidence", 0.25))
         results = None
         try:
-            results = model.track(
-                frame,
-                persist=True,
-                conf=conf,
-                imgsz=imgsz,
-                verbose=False,
-                tracker="bytetrack.yaml",
-                classes=list(VEHICLE_CLASSES),
-            )
+            with INFERENCE_LOCK:
+                results = model.track(
+                    frame,
+                    persist=True,
+                    conf=conf,
+                    imgsz=imgsz,
+                    verbose=False,
+                    tracker="bytetrack.yaml",
+                    classes=list(VEHICLE_CLASSES),
+                )
         except Exception:
             results = None
         if results is None:
-            results = model.predict(frame, conf=conf, imgsz=imgsz, verbose=False, classes=list(VEHICLE_CLASSES))
+            try:
+                with INFERENCE_LOCK:
+                    results = model.predict(frame, conf=conf, imgsz=imgsz, verbose=False, classes=list(VEHICLE_CLASSES))
+            except Exception as exc:
+                raise RuntimeError(f"Model inference failed: {type(exc).__name__}") from exc
         result = results[0] if results else None
         boxes: list[tuple] = []
         if result is None or result.boxes is None or len(result.boxes) == 0:
@@ -465,13 +614,13 @@ class StreamManager:
         self._lock = threading.Lock()
 
     def get(self, stream_id: str) -> StreamSession | None:
+        """Current session for the stream (kept after it stops so status/errors stay readable)."""
         with self._lock:
-            session = self._sessions.get(stream_id)
-        if session and not session.alive and session.status in {"error", "idle"}:
-            return session
-        return session
+            return self._sessions.get(stream_id)
 
-    def start(self, stream: Stream, spaces: list[dict], inference: dict[str, Any]) -> StreamSession:
+    def start(
+        self, stream: Stream, spaces: list[dict], inference: dict[str, Any], *, explicit: bool = False
+    ) -> StreamSession:
         source = stream.url if stream.kind == "url" else None
         if stream.kind != "url":
             from ..database import SessionLocal
@@ -488,8 +637,11 @@ class StreamManager:
         with self._lock:
             existing = self._sessions.get(stream.id)
             if existing and existing.alive:
+                if explicit:
+                    existing.explicitly_started = True
                 return existing
             session = StreamSession(stream, source, spaces, inference)
+            session.explicitly_started = explicit
             self._sessions[stream.id] = session
         session.start()
         return session
@@ -500,15 +652,22 @@ class StreamManager:
         if session is None:
             return False
         session.stop(timeout=timeout)
+        drop_stream_models(stream_id)  # release per-stream tracker/model state
         if session.status == "live":
             session._write_db(status="idle", error=None)
         return True
 
     def stop_if_idle(self, stream_id: str) -> None:
+        """Stop viewer-driven sessions once their last viewer disconnects.
+
+        Sessions an operator started explicitly via POST /start keep running
+        until they are stopped (or the app shuts down) — otherwise leaving the
+        page would silently kill a camera the operator asked to monitor.
+        """
         session = self.get(stream_id)
         if session is None:
             return
-        if session.subscribers <= 0:
+        if session.subscribers <= 0 and not session.explicitly_started:
             self.stop(stream_id, timeout=2.0)
 
     def active(self) -> dict[str, StreamSession]:

@@ -10,7 +10,6 @@ from collections import defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import mean
-from uuid import uuid4
 
 try:
     import cv2
@@ -21,7 +20,6 @@ except ModuleNotFoundError as exc:  # pragma: no cover - only hit with a broken 
         "or start everything with `./scripts/run_local.sh`."
     ) from exc
 import numpy as np
-from sqlalchemy import delete
 
 from ..config import settings
 from ..database import SessionLocal

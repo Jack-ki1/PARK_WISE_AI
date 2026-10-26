@@ -16,16 +16,23 @@ from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..database import SessionLocal, get_db
-from ..models import DetectionSample, OccupancySample, ParkingSpace, VideoJob
+from ..models import DetectionSample, OccupancySample, ParkingSpace, Stream, VideoJob
 from ..schemas import DashboardSummary, DetectionPoint, OccupancyPoint, OccupancySeries, PublicSourceList, SourceOut, SpaceCreate, SpaceOut, VideoJobOut
-from ..security import current_user, rate_limit
+from ..security import current_user, rate_limit, require_roles
 from ..services import activity, billing, settings_store
+from ..services.live_stream import manager
 from ..services.public_sources import PUBLIC_SOURCES, list_public_sources
 from ..services.video_pipeline import inspect_video, process_video_job
+from . import ws_tickets
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", dependencies=[Depends(current_user)])
+# The job-progress WebSocket authenticates through a short-lived ticket (see ws_tickets).
+ws_router = APIRouter(prefix="/api")
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
+# Analyst role: viewers may read results, but importing, analysing and deleting
+# footage (and editing bay calibration) requires admin or operator.
+VIDEO_WRITERS = ["admin", "operator"]
 
 
 def _video_out(job: VideoJob, db: Session) -> VideoJobOut:
@@ -142,7 +149,9 @@ def dashboard_summary(db: Session = Depends(get_db)):
     occupied = sum(1 for space in latest_spaces if space.state == "occupied")
     free = sum(1 for space in latest_spaces if space.state == "free")
     unknown = len(latest_spaces) - occupied - free
-    occupancy = (occupied / len(latest_spaces) * 100) if latest_spaces and occupied + free > 0 else None
+    # Utilisation over observed states only: an unknown bay must not dilute the share
+    # (same denominator as GET /api/dashboard/analytics).
+    occupancy = (occupied / (occupied + free) * 100) if occupied + free > 0 else None
     latest_confidence = latest_sample.mean_confidence if latest_sample else (latest.avg_confidence if latest else None)
     peak = db.query(func.max(VideoJob.max_vehicle_count)).filter(VideoJob.status == "completed").scalar()
     return DashboardSummary(
@@ -171,7 +180,8 @@ def list_videos(db: Session = Depends(get_db)):
 
 
 @router.post("/videos/upload", response_model=VideoJobOut, status_code=201, dependencies=[Depends(rate_limit)])
-async def upload_video(file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def upload_video(file: UploadFile = File(...), user=Depends(current_user), db: Session = Depends(get_db)):
+    require_roles(user, VIDEO_WRITERS)
     billing.check_can_upload(db)
     extension = Path(file.filename or "").suffix.lower()
     if extension not in ALLOWED_EXTENSIONS:
@@ -204,7 +214,8 @@ async def upload_video(file: UploadFile = File(...), db: Session = Depends(get_d
 
 
 @router.post("/public-sources/{source_id}/fetch", response_model=VideoJobOut, status_code=201, dependencies=[Depends(rate_limit)])
-async def fetch_public_source(source_id: str, db: Session = Depends(get_db)):
+async def fetch_public_source(source_id: str, user=Depends(current_user), db: Session = Depends(get_db)):
+    require_roles(user, VIDEO_WRITERS)
     if not settings_store.get(db, "public_sources_enabled"):
         raise HTTPException(status_code=403, detail="Public-source fetching is disabled by server configuration")
     billing.check_can_upload(db)
@@ -254,8 +265,9 @@ def get_video(video_id: str, db: Session = Depends(get_db)):
 
 
 @router.delete("/videos/{video_id}", status_code=204, dependencies=[Depends(rate_limit)])
-def delete_video(video_id: str, db: Session = Depends(get_db)):
+def delete_video(video_id: str, user=Depends(current_user), db: Session = Depends(get_db)):
     """Remove a video job, its stored samples and every derived media file on disk."""
+    require_roles(user, VIDEO_WRITERS)
     job = _load_job(video_id, db)
     if job.status in {"queued", "processing"}:
         raise HTTPException(status_code=409, detail="Wait until processing ends before deleting this video")
@@ -264,14 +276,26 @@ def delete_video(video_id: str, db: Session = Depends(get_db)):
         Path(job.file_path),
         Path(job.preview_path) if job.preview_path else None,
         Path(job.processed_video_path) if job.processed_video_path else None,
+        # Derived outputs are keyed by id, so they are removed even when a failed
+        # re-run already nulled processed_video_path (otherwise they orphan).
+        settings.data_path / "processed" / f"{video_id}_annotated.mp4",
+        settings.data_path / "processed" / f"{video_id}_annotated.avi",
         # Intermediate OpenCV-written file left behind when H.264 conversion ran.
         settings.data_path / "processed" / f"{video_id}_annotated_opencv.mp4",
         settings.data_path / "processed" / f"{video_id}_annotated_opencv.avi",
     ]
+    # Replay streams point at this file: detach them instead of leaving a dangling id
+    # (the ORM-level ON DELETE SET NULL rule only fires when the DB enforces FKs).
+    affected_streams = db.query(Stream).filter(Stream.video_id == video_id).all()
+    for stream in affected_streams:
+        stream.video_id = None
+    running = [stream.id for stream in affected_streams if stream.status == "live"]
     # OccupancySample has no ORM relationship, so it must be removed before the job row.
     db.query(OccupancySample).filter(OccupancySample.video_id == video_id).delete(synchronize_session=False)
     db.delete(job)  # cascades ParkingSpace and DetectionSample rows
     db.commit()
+    for stream_id in running:
+        manager.stop(stream_id)
     activity.record(db, "operator", "video.deleted", "video", video_id, deleted_name)
     for path in media_paths:
         if path is None:
@@ -283,7 +307,8 @@ def delete_video(video_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/videos/{video_id}/process", response_model=VideoJobOut, status_code=202, dependencies=[Depends(rate_limit)])
-def process_video(video_id: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+def process_video(video_id: str, background_tasks: BackgroundTasks, user=Depends(current_user), db: Session = Depends(get_db)):
+    require_roles(user, VIDEO_WRITERS)
     job = _load_job(video_id, db)
     if job.status in {"queued", "processing"}:
         raise HTTPException(status_code=409, detail="This video is already queued or processing")
@@ -349,7 +374,8 @@ def list_spaces(video_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/videos/{video_id}/spaces", response_model=SpaceOut, status_code=201, dependencies=[Depends(rate_limit)])
-def create_space(video_id: str, payload: SpaceCreate, db: Session = Depends(get_db)):
+def create_space(video_id: str, payload: SpaceCreate, user=Depends(current_user), db: Session = Depends(get_db)):
+    require_roles(user, VIDEO_WRITERS)
     job = _load_job(video_id, db)
     if job.status in {"queued", "processing"}:
         raise HTTPException(status_code=409, detail="Wait until processing ends before changing calibration")
@@ -364,7 +390,8 @@ def create_space(video_id: str, payload: SpaceCreate, db: Session = Depends(get_
 
 
 @router.delete("/videos/{video_id}/spaces/{space_id}", status_code=204, dependencies=[Depends(rate_limit)])
-def delete_space(video_id: str, space_id: str, db: Session = Depends(get_db)):
+def delete_space(video_id: str, space_id: str, user=Depends(current_user), db: Session = Depends(get_db)):
+    require_roles(user, VIDEO_WRITERS)
     job = _load_job(video_id, db)
     if job.status in {"queued", "processing"}:
         raise HTTPException(status_code=409, detail="Wait until processing ends before changing calibration")
@@ -409,8 +436,31 @@ def video_occupancy(video_id: str, db: Session = Depends(get_db)):
     )
 
 
-@router.websocket("/ws/videos/{video_id}")
+@router.post("/videos/{video_id}/ws-ticket", dependencies=[Depends(rate_limit)])
+def video_ws_ticket(video_id: str, user=Depends(current_user), db: Session = Depends(get_db)) -> dict:
+    """Mint a short-lived, single-use ticket so a browser can open the job-progress
+    WebSocket without putting a durable API key in the URL."""
+    _load_job(video_id, db)
+    ticket = ws_tickets.create_ticket("video", video_id)
+    return {
+        "ticket": ticket,
+        "expires_in_seconds": ws_tickets.TTL_SECONDS,
+        "note": "Use this ticket in the WebSocket URL as ?ticket=TICKET_VALUE. Valid for one connection only.",
+    }
+
+
+@ws_router.websocket("/ws/videos/{video_id}")
 async def video_job_socket(websocket: WebSocket, video_id: str):
+    """1 Hz job-progress push; ticket-gated when auth is required (browsers cannot
+    attach API-key headers to a WebSocket handshake)."""
+    if settings.auth_required:
+        ticket = websocket.query_params.get("ticket")
+        if not ws_tickets.validate_ticket(ticket, "video", video_id):
+            await websocket.close(
+                code=4401,
+                reason="Authentication required: request a ticket via POST /api/videos/{id}/ws-ticket",
+            )
+            return
     await websocket.accept()
     try:
         while True:

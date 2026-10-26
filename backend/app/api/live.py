@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import uuid
+from pathlib import Path
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
@@ -16,35 +18,50 @@ from ..config import settings as env_settings
 from ..database import SessionLocal, get_db
 from ..models import Stream, VideoJob
 from ..schemas import StreamCreate, StreamPatch, StreamSpacesSave
-from ..security import actor_name, authenticate, current_user, rate_limit, validate_external_url
+from ..security import actor_name, current_user, rate_limit, redact_url, require_roles, validate_external_url
 from ..services import activity, billing, settings_store
 from ..services.live_stream import load_spaces, manager, save_snapshot, snapshot_for
+from . import ws_tickets
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", dependencies=[Depends(current_user)])
-# The frame WebSocket authenticates via ?key= when auth is required (browsers cannot
-# send headers on a WebSocket handshake), so it lives on a router without header auth.
+# The frame WebSocket authenticates via a short-lived single-use ticket (?ticket=)
+# when auth is required (browsers cannot send headers on a WebSocket handshake),
+# so it lives on a router without header auth.
 ws_router = APIRouter(prefix="/api")
+
+# Operators only: viewers may watch streams but never create, reconfigure or
+# stop them (read routes stay open to every authenticated role).
+STREAM_WRITERS = ["admin", "operator"]
 
 
 def _stream_out(db: Session, stream: Stream) -> dict:
     session = manager.get(stream.id)
     spaces = load_spaces(stream)
     job = db.get(VideoJob, stream.video_id) if stream.video_id else None
+    display_url = redact_url(stream.url)
+    source_mode = "replay" if stream.kind == "video" else "live_camera"
+    status = session.status if session and session.alive else stream.status
     return {
         "id": stream.id,
         "name": stream.name,
         "kind": stream.kind,
-        "url": stream.url,
+        "source_mode": source_mode,
+        # Redacted for display: any embedded userinfo is stripped and never returned.
+        "url": display_url,
         "video_id": stream.video_id,
         "video_name": job.original_name if job else None,
         "enabled": stream.enabled,
-        "status": session.status if session and session.alive else stream.status,
+        "status": status,
+        "stale": bool(session and session.alive and session.is_stale()),
         "last_error": session.last_error if session and session.alive else stream.last_error,
         "target_fps": stream.target_fps,
         "running": bool(session and session.alive),
         "subscriber_count": session.subscribers if session else stream.subscriber_count,
         "frames_delivered": session.frames_delivered if session else stream.frames_delivered,
         "last_frame_at": stream.last_frame_at.isoformat() if stream.last_frame_at else None,
+        "last_frame_age_seconds": session.frame_age_seconds() if session else None,
         "lat": stream.lat,
         "lon": stream.lon,
         "spaces": spaces,
@@ -71,8 +88,10 @@ def list_streams(db: Session = Depends(get_db)) -> dict:
 def create_stream(
     payload: StreamCreate, user=Depends(current_user), db: Session = Depends(get_db)
 ) -> dict:
-    billing.check_can_add_stream(db)
+    require_roles(user, STREAM_WRITERS)
     url = None
+    # Validate input (422) before any quota check (402) so bad URLs are never
+    # masked by plan limits, and dangerous sources are rejected first.
     if payload.kind == "url":
         if not payload.url:
             raise HTTPException(status_code=422, detail="url is required for kind='url'")
@@ -83,6 +102,7 @@ def create_stream(
     else:
         if not payload.video_id or db.get(VideoJob, payload.video_id) is None:
             raise HTTPException(status_code=422, detail="video_id must reference an existing upload")
+    billing.check_can_add_stream(db)
     stream = Stream(
         id=str(uuid.uuid4()),
         name=payload.name,
@@ -109,6 +129,7 @@ def get_stream(stream_id: str, db: Session = Depends(get_db)) -> dict:
 def patch_stream(
     stream_id: str, payload: StreamPatch, user=Depends(current_user), db: Session = Depends(get_db)
 ) -> dict:
+    require_roles(user, STREAM_WRITERS)
     stream = _load_stream(db, stream_id)
     data = payload.model_dump(exclude_unset=True)
     if "url" in data and data["url"]:
@@ -129,11 +150,18 @@ def patch_stream(
 
 @router.delete("/streams/{stream_id}", status_code=204, dependencies=[Depends(rate_limit)])
 def delete_stream(stream_id: str, user=Depends(current_user), db: Session = Depends(get_db)) -> Response:
+    require_roles(user, STREAM_WRITERS)
     stream = _load_stream(db, stream_id)
     manager.stop(stream_id)
     activity.record(db, actor_name(user), "stream.deleted", "stream", stream.id, stream.name)
+    snapshot = Path(stream.snapshot_path) if stream.snapshot_path else None
     db.delete(stream)
     db.commit()
+    if snapshot is not None:
+        try:
+            snapshot.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Could not remove calibration snapshot for deleted stream %s", stream_id)
     return Response(status_code=204)
 
 
@@ -141,6 +169,7 @@ def delete_stream(stream_id: str, user=Depends(current_user), db: Session = Depe
 def save_stream_spaces(
     stream_id: str, payload: StreamSpacesSave, user=Depends(current_user), db: Session = Depends(get_db)
 ) -> dict:
+    require_roles(user, STREAM_WRITERS)
     stream = _load_stream(db, stream_id)
     stream.spaces_json = json.dumps([space.model_dump() for space in payload.spaces])
     db.commit()
@@ -149,19 +178,48 @@ def save_stream_spaces(
 
 
 @router.post("/streams/{stream_id}/snapshot", dependencies=[Depends(rate_limit)])
-def capture_snapshot(stream_id: str, db: Session = Depends(get_db)) -> dict:
+def capture_snapshot(stream_id: str, user=Depends(current_user), db: Session = Depends(get_db)) -> dict:
+    """Capture a snapshot from a running stream (or a one-shot grab) for calibration."""
+    require_roles(user, STREAM_WRITERS)
     stream = _load_stream(db, stream_id)
-    inference = settings_store.inference_config(db)
-    try:
-        jpeg = snapshot_for(stream, load_spaces(stream), inference)
-    except Exception as exc:  # pragma: no cover - cv2/source specific
-        raise HTTPException(status_code=502, detail=f"Could not capture frame: {exc}") from None
+    session = manager.get(stream_id)
+    jpeg = None
+    if session and session.alive:
+        _, jpeg, _ = session.snapshot()
     if not jpeg:
-        raise HTTPException(status_code=502, detail="Source did not deliver a frame")
+        inference = settings_store.inference_config(db)
+        jpeg = snapshot_for(stream, load_spaces(stream), inference)
+    if not jpeg:
+        raise HTTPException(status_code=502, detail="Could not capture a frame from the source")
     path = save_snapshot(stream_id, jpeg)
     stream.snapshot_path = path
     db.commit()
-    return {"snapshot_url": f"/api/streams/{stream_id}/snapshot", "bytes": len(jpeg)}
+    return {"snapshot_url": f"/api/streams/{stream_id}/snapshot"}
+
+
+@router.post("/streams/{stream_id}/ws-ticket", dependencies=[Depends(rate_limit)])
+def create_websocket_ticket(
+    stream_id: str, 
+    user=Depends(current_user), 
+    db: Session = Depends(get_db)
+) -> dict:
+    """Generate a short-lived, single-use ticket for WebSocket authentication.
+    
+    This prevents exposing durable API keys in WebSocket URLs and provides
+    time-limited access to specific streams.
+    """
+    stream = _load_stream(db, stream_id)
+    if not stream.enabled:
+        raise HTTPException(status_code=403, detail="Stream is disabled")
+    
+    ticket = ws_tickets.create_ticket("stream", stream_id)
+    activity.record(db, actor_name(user), "stream.ws_ticket_created", "stream", stream_id, "WebSocket access granted")
+
+    return {
+        "ticket": ticket,
+        "expires_in_seconds": ws_tickets.TTL_SECONDS,
+        "note": "Use this ticket in the WebSocket URL as ?ticket=TICKET_VALUE. Valid for one connection only."
+    }
 
 
 @router.get("/streams/{stream_id}/snapshot")
@@ -169,8 +227,8 @@ def get_snapshot(stream_id: str, db: Session = Depends(get_db)) -> FileResponse:
     stream = _load_stream(db, stream_id)
     if not stream.snapshot_path:
         raise HTTPException(status_code=404, detail="No snapshot captured yet")
-    path = env_settings.data_path / "streams" / f"{stream_id}_calib.jpg"
-    if not path.exists():
+    path = Path(stream.snapshot_path)
+    if not path.is_file():
         raise HTTPException(status_code=404, detail="Snapshot file is missing")
     return FileResponse(path, media_type="image/jpeg")
 
@@ -183,20 +241,24 @@ def stream_events(stream_id: str, db: Session = Depends(get_db)) -> dict:
 
 
 @router.post("/streams/{stream_id}/start", dependencies=[Depends(rate_limit)])
-def start_stream(stream_id: str, db: Session = Depends(get_db)) -> dict:
+def start_stream(stream_id: str, user=Depends(current_user), db: Session = Depends(get_db)) -> dict:
+    require_roles(user, STREAM_WRITERS)
     stream = _load_stream(db, stream_id)
     if not stream.enabled:
         raise HTTPException(status_code=409, detail="Stream is disabled")
     inference = settings_store.inference_config(db)
     try:
-        session = manager.start(stream, load_spaces(stream), inference)
+        # explicit=True: the operator asked for this session, so it survives
+        # viewers disconnecting (see StreamManager.stop_if_idle).
+        session = manager.start(stream, load_spaces(stream), inference, explicit=True)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
     return {"status": session.status, "running": session.alive}
 
 
 @router.post("/streams/{stream_id}/stop", dependencies=[Depends(rate_limit)])
-def stop_stream(stream_id: str, db: Session = Depends(get_db)) -> dict:
+def stop_stream(stream_id: str, user=Depends(current_user), db: Session = Depends(get_db)) -> dict:
+    require_roles(user, STREAM_WRITERS)
     _load_stream(db, stream_id)
     stopped = manager.stop(stream_id)
     return {"status": "idle", "stopped": stopped}
@@ -204,16 +266,19 @@ def stop_stream(stream_id: str, db: Session = Depends(get_db)) -> dict:
 
 @ws_router.websocket("/ws/streams/{stream_id}")
 async def stream_frames(websocket: WebSocket, stream_id: str) -> None:
-    """Push annotated frames (base64 JPEG) + occupancy/event payloads while connected."""
+    """Push annotated frames (base64 JPEG) + occupancy/event payloads while connected.
+
+    Authentication uses short-lived single-use tickets (?ticket=XYZ) instead of
+    durable API keys, so credentials never appear in URLs, logs or proxies.
+    """
     if env_settings.auth_required:
-        token = websocket.query_params.get("key")
-        db_probe = SessionLocal()
-        try:
-            if authenticate(db_probe, token) is None:
-                await websocket.close(code=4401, reason="A valid API key is required")
-                return
-        finally:
-            db_probe.close()
+        ticket = websocket.query_params.get("ticket")
+        if not ws_tickets.validate_ticket(ticket, "stream", stream_id):
+            await websocket.close(
+                code=4401,
+                reason="Authentication required: request a ticket via POST /api/streams/{id}/ws-ticket",
+            )
+            return
 
     db = SessionLocal()
     try:
@@ -277,7 +342,7 @@ async def stream_frames(websocket: WebSocket, stream_id: str) -> None:
                         }
                     )
                 )
-            now = asyncio.get_event_loop().time()
+            now = asyncio.get_running_loop().time()
             if now - last_ping > 2.0:
                 last_ping = now
                 await websocket.send_text(
@@ -287,6 +352,9 @@ async def stream_frames(websocket: WebSocket, stream_id: str) -> None:
                             "status": session.status,
                             "error": session.last_error,
                             "subscribers": session.subscribers,
+                            "source_mode": session.source_mode,
+                            "last_frame_age_seconds": session.frame_age_seconds(),
+                            "stale": session.is_stale(),
                         }
                     )
                 )

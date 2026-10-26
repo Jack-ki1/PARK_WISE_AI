@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ..models import ActivityEvent
@@ -51,20 +50,3 @@ def recent(db: Session, limit: int = 50) -> list[dict]:
         }
         for row in rows
     ]
-
-
-def breakdown(db: Session, days: int = 14) -> dict:
-    """Action counts for the window plus per-day buckets (drives the dashboard bar chart)."""
-    from datetime import datetime, timedelta, timezone
-
-    start = datetime.now(timezone.utc) - timedelta(days=max(1, days))
-    query = db.query(ActivityEvent).filter(ActivityEvent.created_at >= start)
-    by_action: dict[str, int] = {}
-    by_day: dict[str, dict[str, int]] = {}
-    for row in query.all():
-        by_action[row.action] = by_action.get(row.action, 0) + 1
-        day = row.created_at.date().isoformat() if row.created_at else "unknown"
-        bucket = by_day.setdefault(day, {})
-        bucket[row.action] = bucket.get(row.action, 0) + 1
-    total = db.query(func.count(ActivityEvent.id)).scalar() or 0
-    return {"window_days": days, "total_events": int(total), "by_action": by_action, "by_day": by_day}

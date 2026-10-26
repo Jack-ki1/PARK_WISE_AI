@@ -1,0 +1,95 @@
+   ParkWise AI — Deep Review: Issue Map & Improvement Areas
+
+   What it is: FastAPI/OpenCV/YOLO parking-video analytics (backend ~4.5k LOC) + Next.js dashboard (~2.9k LOC), SQLite default,
+   API-key RBAC, ticketed WebSockets. The codebase is genuinely well-engineered in places (SSRF guard, one-use WS tickets, last-admin
+    protection, honest empty states). Below are the real issues, verified against source.
+
+   🔴 Critical — broken core behavior
+
+   Live bay occupancy is permanently wrong — live_stream.py:38-54, 505-517, 352-353. point_in_polygon expects normalized 0..1
+   polygons (confirmed by _annotate:531 multiplying by frame dims), but _detect returns pixel centers that are fed straight into
+   BayTracker.update() and DirectionCounter. For any frame wider/taller than 1px the ray-cast never intersects → every live bay
+   reports free forever; overcrowding webhooks and line-crossing events never fire. Fix: divide centers by width/height before
+   tracker.update(...), or denormalize polygons once per session. (The batch pipeline is unaffected — only the live path.)
+   Quota math: seconds reported as minutes — billing.py:44-49, 60. analysis_minutes_this_month = sum(duration_seconds) with no /60. A
+    10-minute video counts as 600 "minutes" and instantly trips the Starter cap, blocking uploads/analysis. Fix: minutes_row / 60.0.
+   Operator can self-escalate billing plan — admin.py:60 + settings_store.py:151. PUT /api/settings accepts operator role and
+   set_many allows any SETTING_SCHEMA key — including plan. An operator POSTs {"plan":"scale"} to lift quotas, making the billing
+   gate meaningless. Fix: per-key role policy (plan/webhook_url → admin only), like the existing webhook_secret block.
+
+   🟠 High — reliability & security
+
+   Jobs stuck forever after restart — main.py:36-41 resets stale streams but not VideoJob rows. After a crash/restart,
+   queued/processing jobs are permanent: reprocess/delete/calibrate all 409 (routes.py:272,313,380,396), billing's concurrent_jobs
+   blocks Starter forever, and samples were already deleted pre-enqueue (routes.py:317). Fix: startup UPDATE video_jobs SET
+   status='failed' WHERE status IN ('queued','processing'); also claim jobs atomically (UPDATE ... WHERE status='queued', check
+   rowcount) — the current check-then-set in routes.py:309 and video_pipeline.py:203 allows double-processing.
+   Fail-open defaults — config.py:10,25, main.py:25-31, .env.example. api_host=0.0.0.0 + auth_required=false + run_local.sh and
+   Docker both bind publicly: a LAN-exposed unauthenticated admin API by default; startup only warns. Fix: fatal error (not warning)
+   for non-loopback bind without auth; loopback default in run_local.sh/.env.example.
+   SSRF DNS-rebinding TOCTOU — security.py:139-157. Validation resolves DNS, then VideoCapture/requests/webhook re-resolves at
+   connect. Also integrations.py:45 calls validate_external_url with default allow_private=True, so webhooks can hit LAN hosts
+   contrary to the docstring. Fix: pin validated IP for connections; pass allow_private=False for webhooks.
+   WS ticket redeem race + not process-shared — ws_tickets.py:56-65. Unsynchronized check-then-delete across the threadpool breaks
+   single-use; in-memory dict breaks under --workers > 1. Fix: threading.Lock + pop(ticket, None).
+   Docker deploy: baked API URL bug — docker-compose.yml sets NEXT_PUBLIC_API_BASE_URL at runtime, but web/Dockerfile has no ARG; the
+    value is inlined at build, so the container always talks to http://localhost:8000. From the quick start this is the #1
+   user-facing breakage. Fix: ARG NEXT_PUBLIC_API_BASE_URL + build.args in compose.
+   video_pipeline.py has zero direct tests — the core detection/merge/multiscale/_space_states logic is untested (grep confirms).
+   Given finding #1 slipped through the live twin of this logic, this is the highest-value test investment.
+   Backend container runs as root (backend/Dockerfile, no USER); web build ignores lockfile (npm install on package.json only, no npm
+    ci, no package-lock.json copy); requirements only range-pinned → non-reproducible builds.
+
+   🟡 Medium
+
+   - SQLite untuned for the actual threading model — database.py:10-11: no WAL, no busy_timeout, no foreign_keys=ON (so all
+   ondelete="CASCADE" clauses in models.py are dead code). Multiple writer threads (pipeline, streams, last_login_at updates) will
+   hit database is locked.
+   - No HTTP Range on media endpoints — routes.py:344-366: FileResponse ignores Range; browsers can't seek the original/annotated
+   MP4s.
+   - Unbounded queries — routes.py:410-436, insights.py:69-85,175: /analytics, /occupancy serialize every sample row (100k+ rows on a
+    30-min run); list_videos caps at 100 with no offset. Also confidence_values list grows unbounded during a run
+   (video_pipeline.py:279).
+   - Rate-limiter flaws — security.py:241-286: auth attempts aren't limited (unlimited key-bruteforce, each hitting the DB); fake
+   unique keys grow _hits past 512 without eviction; fixed window allows ~2× burst; no trusted-proxy config, so behind nginx all
+   clients share one bucket.
+   - Stream session lifecycle — live_stream.py: reconnect_attempts never resets after success (5 transient blips over hours
+   permanently kill the session); stop() can leak the capture thread and its model while writing idle only when status was live;
+   StreamManager.start race can spawn two threads on one stream (:637-646).
+   - Model lock/eviction — model_store.py:44-70: ultralytics load happens holding the global _LOCK (app-wide stall on first use);
+   eviction is insertion-order, so a running stream's model can be evicted, silently resetting ByteTrack IDs.
+   - Frontend race + perf — dashboard/page.tsx:284-288: 5s setInterval with no in-flight guard; overlapping Promise.all can apply
+   stale snapshots over fresh ones; no AbortController. The 1,785-line monolith re-renders ~45 state hooks per live frame (~6fps). No
+    WebSocket reconnect (:359 — a blip ends the session and re-clicking Watch doesn't restart the effect since watchId is unchanged).
+   - Frontend data bugs — CSV export's video_id column always empty (page.tsx:649-662, field is id); ShareBar legend colors desync
+   after zero-value filter (charts.tsx:282-297); Donut duplicate-label key collisions (charts.tsx:170); theme bootstrap defaults
+   light vs getServerSnapshot "dark" hydration mismatch (layout.tsx:25 vs data.ts:315); no runtime validation on API payloads
+   (data.ts:209).
+   - CI/CD — actions not SHA-pinned, no permissions: reduction, no npm cache, no slow-tier/coverage jobs.
+
+   🔵 Low / polish
+
+   - Internal exceptions leak to clients: str(exc) in routes.py:211,256, error_message (up to 2000 chars of exception text incl.
+   paths) echoed to any viewer.
+   - Activity audit hardcodes "operator" for video mutations (routes.py:212,248,333,388) while live/admin use real actor names.
+   - Bearer prefix match case-sensitive (security.py:181); redact_url keeps query strings (security.py:160); broadcast/multicast IPs
+   not blocked; /docs enabled in production; VideoJobOut/StreamOut response-model claim in security.py:6 overstates reality.
+   - WS close-before-accept (4401) surfaces as bare 403 on most ASGI servers (routes.py:459, live.py:277).
+   - Hardcoded Pexels direct-file URLs will rot (public_sources.py:8-42) — no checksum/fallback.
+   - Version chip says "v2.0.0" vs package.json 1.0.0 (page.tsx:801); dev-command hint shown to browser users (data.ts:148);
+   web/tsconfig.tsbuildinfo still tracked in git; .qoder/ not gitignored; docs/API.md:125 documents a non-existent POST /api/billing;
+    missing GET /streams/{id}/snapshot docs.
+   - No error.tsx/loading.tsx boundaries anywhere; CalibrationCanvas is mouse-only (a11y); tab lists lack keyboard/aria wiring.
+
+   Suggested fix order
+
+   1. #1-#3 (correctness/security in one file each: normalize coords, /60, per-key role policy) — small diffs, biggest impact.
+   2. #4-#5, #8 (startup job reset, fail-closed bind, compose ARG) — deploy-blocking.
+   3. #6, #7, #10 + SQLite PRAGMAs.
+   4. Unit tests for video_pipeline/BayTracker with synthetic numpy inputs — this class of bug (#1) is exactly what they'd catch.
+   5. Structural: split dashboard/page.tsx into route-level components; add WS reconnect + poll generation guard; per-key settings
+   roles; pagination + Range responses.
+   6. Roadmap-level (already flagged honestly in README): durable job queue, Postgres, object storage, tenant isolation, retention
+   automation.
+
+   Want me to start fixing any of these? The top three are each a small, testable change.

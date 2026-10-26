@@ -76,6 +76,7 @@ def dashboard_analytics(db: Session = Depends(get_db)) -> dict:
             VideoJob.duration_seconds,
             func.count(OccupancySample.id).label("samples"),
             func.sum((OccupancySample.state == "occupied").cast(Integer)).label("occupied"),
+            func.sum((OccupancySample.state == "free").cast(Integer)).label("free"),
         )
         .outerjoin(OccupancySample, OccupancySample.video_id == VideoJob.id)
         .filter(VideoJob.status == "completed")
@@ -87,7 +88,10 @@ def dashboard_analytics(db: Session = Depends(get_db)) -> dict:
     for row in per_video:
         samples = int(row.samples or 0)
         occupied = int(row.occupied or 0)
-        percent = round(occupied / samples * 100, 1) if samples else None
+        free = int(row.free or 0)
+        # Only use observed states (occupied + free) as denominator, exclude unknown
+        observed = occupied + free
+        percent = round(occupied / observed * 100, 1) if observed > 0 else None
         day = row.completed_at.date().isoformat() if row.completed_at else "unknown"
         if percent is not None:
             trend_by_day.setdefault(day, []).append(percent)
@@ -97,7 +101,8 @@ def dashboard_analytics(db: Session = Depends(get_db)) -> dict:
                 "name": row.original_name,
                 "completed_at": row.completed_at.isoformat() if row.completed_at else None,
                 "peak_vehicles": row.max_vehicle_count,
-                "avg_confidence": round(row.avg_confidence, 3) if row.avg_confidence else None,
+                # Handle 0.0 confidence correctly - don't convert to None
+                "avg_confidence": round(float(row.avg_confidence), 3) if row.avg_confidence is not None else None,
                 "duration_seconds": row.duration_seconds,
                 "samples": samples,
                 "occupied_share_percent": percent,
@@ -144,7 +149,7 @@ def dashboard_analytics(db: Session = Depends(get_db)) -> dict:
             **totals,
             "analyzed_hours": round(duration / 3600.0, 2),
             "peak_vehicles": int(peak) if peak is not None else None,
-            "avg_confidence": round(float(avg_conf), 3) if avg_conf else None,
+            "avg_confidence": round(float(avg_conf), 3) if avg_conf is not None else None,
             "utilisation_percent": utilisation_percent,
             "storage_gb": round(usage["storage_bytes"] / (1024**3), 2),
             "concurrent_jobs": usage["concurrent_jobs"],

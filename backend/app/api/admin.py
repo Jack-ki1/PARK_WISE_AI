@@ -21,13 +21,25 @@ router = APIRouter(prefix="/api", dependencies=[Depends(current_user)])
 
 
 def _settings_out(db: Session) -> dict:
+    """Return settings with secrets redacted for safe API exposure."""
+    raw_settings = settings_store.get_all(db)
+    # Redact sensitive values - never expose secrets to the client
+    safe_settings = {**raw_settings}
+    if "webhook_secret" in safe_settings:
+        # Only indicate whether a secret is configured, never return the value
+        safe_settings["webhook_secret_configured"] = bool(safe_settings.pop("webhook_secret"))
+    
     return {
-        "settings": settings_store.get_all(db),
+        "settings": safe_settings,
         "schema": {
             key: {"type": meta["type"], "choices": meta.get("choices")}
             for key, meta in settings_store.SETTING_SCHEMA.items()
         },
         "plans": settings_store.PLANS,
+        "pricing_note": (
+            "Plan prices are illustrative local configuration only; "
+            "no payment processor is connected in this build."
+        ),
         "env": {
             "auth_required": env_settings.auth_required,
             "rate_limit_per_minute": env_settings.rate_limit_per_minute,
@@ -46,13 +58,59 @@ def get_settings(db: Session = Depends(get_db)) -> dict:
 @router.put("/settings", dependencies=[Depends(rate_limit)])
 def put_settings(payload: dict, user=Depends(current_user), db: Session = Depends(get_db)) -> dict:
     require_roles(user, ["admin", "operator"])
-    if not isinstance(payload, dict) or not payload:
+    if not payload:
         raise HTTPException(status_code=422, detail="Provide a non-empty object of settings")
+    
+    # Block direct webhook_secret writes - use dedicated endpoint instead
+    if "webhook_secret" in payload:
+        raise HTTPException(
+            status_code=422, 
+            detail="Use POST /api/integrations/webhook/secret to manage webhook secrets"
+        )
+    
     try:
         settings_store.set_many(db, payload)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
     activity.record(db, actor_name(user), "settings.updated", "settings", None, ", ".join(payload))
+    return _settings_out(db)
+
+
+@router.post("/integrations/webhook/secret", dependencies=[Depends(rate_limit)])
+def set_webhook_secret(
+    payload: dict, 
+    user=Depends(current_user), 
+    db: Session = Depends(get_db)
+) -> dict:
+    """Securely set, rotate, or clear the webhook secret without exposing it."""
+    require_roles(user, ["admin"])
+    
+    action = payload.get("action")
+    if action not in ("set", "rotate", "clear"):
+        raise HTTPException(status_code=422, detail="action must be 'set', 'rotate', or 'clear'")
+    
+    if action == "set":
+        secret = payload.get("secret")
+        if not secret or not isinstance(secret, str):
+            raise HTTPException(status_code=422, detail="secret is required and must be a string")
+        if len(secret) > 200:
+            raise HTTPException(status_code=422, detail="secret must be 200 characters or fewer")
+        settings_store.set_many(db, {"webhook_secret": secret})
+        activity.record(db, actor_name(user), "webhook.secret_set", "webhook", None, "secret configured")
+    elif action == "rotate":
+        new_secret = secrets.token_urlsafe(48)
+        settings_store.set_many(db, {"webhook_secret": new_secret})
+        activity.record(db, actor_name(user), "webhook.secret_rotated", "webhook", None, "secret rotated")
+        # Return the new secret only once
+        return {
+            "webhook_secret_configured": True,
+            "secret": new_secret,
+            "note": "Copy this secret now; it will not be shown again."
+        }
+    elif action == "clear":
+        settings_store.set_many(db, {"webhook_secret": None})
+        activity.record(db, actor_name(user), "webhook.secret_cleared", "webhook", None, "secret removed")
+    
     return _settings_out(db)
 
 
@@ -71,11 +129,12 @@ def list_users(user=Depends(current_user), db: Session = Depends(get_db)) -> dic
 @router.post("/users", status_code=201, dependencies=[Depends(rate_limit)])
 def create_user(payload: UserCreate, user=Depends(current_user), db: Session = Depends(get_db)) -> dict:
     require_roles(user, ["admin"])
+    actor = actor_name(user)
     exists = db.query(User).filter(User.username == payload.username).first()
     if exists is not None:
         raise HTTPException(status_code=409, detail="Username already exists")
     raw_key = "pk_" + secrets.token_urlsafe(32)
-    user = User(
+    new_user = User(
         id=str(uuid.uuid4()),
         username=payload.username,
         display_name=payload.display_name,
@@ -83,10 +142,10 @@ def create_user(payload: UserCreate, user=Depends(current_user), db: Session = D
         api_key_hash=hash_key(raw_key),
         created_at=datetime.now(timezone.utc),
     )
-    db.add(user)
+    db.add(new_user)
     db.commit()
-    activity.record(db, actor_name(user), "user.created", "user", user.id, f"{user.username} ({user.role})")
-    item = UserOut.model_validate(user).model_dump()
+    activity.record(db, actor, "user.created", "user", new_user.id, f"{new_user.username} ({new_user.role})")
+    item = UserOut.model_validate(new_user).model_dump()
     item["has_api_key"] = True
     return {"user": item, "api_key": raw_key, "api_key_note": "Copy it now; it is shown only once."}
 
@@ -94,55 +153,64 @@ def create_user(payload: UserCreate, user=Depends(current_user), db: Session = D
 @router.patch("/users/{user_id}", dependencies=[Depends(rate_limit)])
 def patch_user(user_id: str, payload: UserPatch, user=Depends(current_user), db: Session = Depends(get_db)) -> dict:
     require_roles(user, ["admin"])
-    user = db.get(User, user_id)
-    if user is None:
+    actor = actor_name(user)
+    target = db.get(User, user_id)
+    if target is None:
         raise HTTPException(status_code=404, detail="User not found")
     data = payload.model_dump(exclude_unset=True)
-    demoting_admin = user.role == "admin" and ("role" in data and data["role"] != "admin")
-    disabling_admin = user.role == "admin" and data.get("is_active") is False
+    demoting_admin = target.role == "admin" and ("role" in data and data["role"] != "admin")
+    disabling_admin = target.role == "admin" and data.get("is_active") is False
     if (demoting_admin or disabling_admin) and _active_admins(db) <= 1:
         raise HTTPException(status_code=409, detail="Cannot remove the last active admin")
     for key, value in data.items():
-        setattr(user, key, value)
+        setattr(target, key, value)
     db.commit()
-    activity.record(db, actor_name(user), "user.updated", "user", user.id, ", ".join(data))
-    item = UserOut.model_validate(user).model_dump()
-    item["has_api_key"] = bool(user.api_key_hash)
+    activity.record(db, actor, "user.updated", "user", target.id, ", ".join(data))
+    item = UserOut.model_validate(target).model_dump()
+    item["has_api_key"] = bool(target.api_key_hash)
     return item
 
 
 @router.post("/users/{user_id}/rotate-key", dependencies=[Depends(rate_limit)])
 def rotate_key(user_id: str, user=Depends(current_user), db: Session = Depends(get_db)) -> dict:
     require_roles(user, ["admin"])
-    user = db.get(User, user_id)
-    if user is None:
+    actor = actor_name(user)
+    target = db.get(User, user_id)
+    if target is None:
         raise HTTPException(status_code=404, detail="User not found")
     raw_key = "pk_" + secrets.token_urlsafe(32)
-    user.api_key_hash = hash_key(raw_key)
+    target.api_key_hash = hash_key(raw_key)
     db.commit()
-    activity.record(db, actor_name(user), "user.key_rotated", "user", user.id, user.username)
-    return {"user_id": user.id, "api_key": raw_key, "api_key_note": "Copy it now; it is shown only once."}
+    activity.record(db, actor, "user.key_rotated", "user", target.id, target.username)
+    return {"user_id": target.id, "api_key": raw_key, "api_key_note": "Copy it now; it is shown only once."}
 
 
 @router.delete("/users/{user_id}", status_code=204, dependencies=[Depends(rate_limit)])
 def delete_user(user_id: str, user=Depends(current_user), db: Session = Depends(get_db)) -> None:
     require_roles(user, ["admin"])
-    user = db.get(User, user_id)
-    if user is None:
+    actor = actor_name(user)
+    target = db.get(User, user_id)
+    if target is None:
         raise HTTPException(status_code=404, detail="User not found")
-    if user.role == "admin" and user.is_active and _active_admins(db) <= 1:
+    if target.role == "admin" and target.is_active and _active_admins(db) <= 1:
         raise HTTPException(status_code=409, detail="Cannot remove the last active admin")
-    activity.record(db, actor_name(user), "user.deleted", "user", user.id, user.username)
-    db.delete(user)
+    activity.record(db, actor, "user.deleted", "user", target.id, target.username)
+    db.delete(target)
     db.commit()
 
 
-@router.get("/billing")
-def get_billing(db: Session = Depends(get_db)) -> dict:
+def _billing_report(db: Session) -> dict:
+    """Full billing report (GET and PUT return the same shape so the dashboard
+    never loses a field it just rendered)."""
     report = billing.billing_report(db)
     report["month"] = datetime.now(timezone.utc).strftime("%Y-%m")
     report["videos_total"] = db.query(func.count(VideoJob.id)).scalar() or 0
     return report
+
+
+@router.get("/billing")
+def get_billing(db: Session = Depends(get_db)) -> dict:
+    return _billing_report(db)
 
 
 @router.put("/billing", dependencies=[Depends(rate_limit)])
@@ -153,9 +221,7 @@ def put_billing(payload: dict, user=Depends(current_user), db: Session = Depends
         raise HTTPException(status_code=422, detail=f"plan must be one of {', '.join(settings_store.PLANS)}")
     settings_store.set_many(db, {"plan": plan})
     activity.record(db, actor_name(user), "billing.plan_changed", "plan", plan, None)
-    report = billing.billing_report(db)
-    report["month"] = datetime.now(timezone.utc).strftime("%Y-%m")
-    return report
+    return _billing_report(db)
 
 
 @router.post("/integrations/webhook/test", dependencies=[Depends(rate_limit)])
