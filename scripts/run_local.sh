@@ -21,8 +21,10 @@ fi
 # Reading them here is what makes those settings meaningful outside Docker.
 API_HOST=$(sed -n 's/^PARKWISE_API_HOST=//p' .env | tail -n 1)
 API_PORT=$(sed -n 's/^PARKWISE_API_PORT=//p' .env | tail -n 1)
-: "${API_HOST:=0.0.0.0}"
+AUTH_REQUIRED=$(sed -n 's/^PARKWISE_AUTH_REQUIRED=//p' .env | tail -n 1)
+: "${API_HOST:=127.0.0.1}"
 : "${API_PORT:=8000}"
+: "${AUTH_REQUIRED:=true}"
 
 if [ ! -d web/node_modules ]; then
   echo "Installing web dependencies..."
@@ -44,8 +46,9 @@ fi
 
 # Always launch through the venv interpreter: a system `uvicorn` would run a
 # different Python and fail with "No module named 'cv2'". Host/port come from
-# .env, which is where the API itself reads them.
-.venv/bin/python3 -m uvicorn app.main:app --app-dir backend &
+# .env, which is where the API itself reads them — pass them explicitly so a
+# non-default port in .env is actually honoured.
+.venv/bin/python3 -m uvicorn app.main:app --app-dir backend --host "$API_HOST" --port "$API_PORT" &
 API_PID=$!
 
 # Do not print "ready" until health actually answers: opening the dashboard
@@ -58,6 +61,17 @@ for _ in $(seq 1 60); do
 done
 if curl -fsS -m 2 "${API_BASE}/api/health" >/dev/null 2>&1; then
   echo "API  ${API_BASE}  (docs: /docs)"
+  # With auth on, the dashboard stays empty until a key exists — say so up front
+  # instead of letting the user puzzle over 401 banners.
+  case "$AUTH_REQUIRED" in
+    true|True|TRUE|1)
+      if ! curl -fsS -m 2 "${API_BASE}/api/dashboard/summary" >/dev/null 2>&1; then
+        echo "Auth is enabled: paste an API key in the dashboard (Reports & Settings ->"
+        echo "API key access). First key? Create one with:"
+        echo "  .venv/bin/python3 scripts/bootstrap_admin.py --username admin --display-name \"Admin\""
+      fi
+      ;;
+  esac
 else
   echo "API did not become healthy at ${API_BASE}/api/health — see the log above."
 fi

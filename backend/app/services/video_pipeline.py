@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import shutil
 import subprocess
 import time
+import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,8 +26,9 @@ import numpy as np
 from ..config import settings
 from ..database import SessionLocal
 from ..models import DetectionSample, OccupancySample, ParkingSpace, VideoJob
+from ..security import sanitize_error_message
 from . import integrations as integrations_service
-from . import settings_store
+from . import job_claim, settings_store
 from .activity import record as record_activity
 from .model_store import get_model
 
@@ -196,17 +199,20 @@ def process_video_job(video_id: str) -> None:
     db = SessionLocal()
     cap = None
     writer = None
+    owner = f"pid-{os.getpid()}:{uuid.uuid4().hex[:8]}"
     try:
         job = db.get(VideoJob, video_id)
         if not job:
             return
-        if job.status == "processing":
-            logger.warning("Job %s is already processing; ignoring duplicate request", video_id)
-            return
         source_path = Path(job.file_path)
+        # Atomic queued -> processing: a second worker for the same id loses here and
+        # must not touch the row (their writers would otherwise clobber each other).
+        if not job_claim.claim(db, video_id, owner=owner):
+            logger.warning("Job %s was already claimed; ignoring duplicate request", video_id)
+            return
+        job = db.get(VideoJob, video_id)
         if not source_path.exists():
             raise FileNotFoundError("Original video file no longer exists on this server.")
-        job.status = "processing"
         db.query(DetectionSample).filter(DetectionSample.video_id == video_id).delete(synchronize_session=False)
         db.query(OccupancySample).filter(OccupancySample.video_id == video_id).delete(synchronize_session=False)
         for old_space in db.query(ParkingSpace).filter(ParkingSpace.video_id == video_id).all():
@@ -215,7 +221,6 @@ def process_video_job(video_id: str) -> None:
             old_space.last_seen_seconds = None
         job.progress_percent = 0.0
         job.error_message = None
-        job.started_at = datetime.now(timezone.utc)
         cfg = settings_store.inference_config(db)  # dashboard overrides win over env defaults
         job.model_name = cfg["model"]
         db.commit()
@@ -253,7 +258,10 @@ def process_video_job(video_id: str) -> None:
         frame_index = -1
         processed_index = 0
         max_vehicles = 0
-        confidence_values: list[float] = []
+        # Running mean: accumulating every per-frame confidence for a 30-minute run
+        # would hold hundreds of thousands of floats in the worker's memory.
+        confidence_total = 0.0
+        confidence_count = 0
         stride = max(1, int(cfg["frame_stride"]))
         scale_candidates = _scale_candidates(width, cfg)
         started = time.monotonic()
@@ -276,7 +284,9 @@ def process_video_job(video_id: str) -> None:
                     if len(detections) >= MULTISCALE_MIN_VEHICLES:
                         break
             confs = [d["confidence"] for d in detections]
-            confidence_values.extend(confs)
+            if confs:
+                confidence_total += float(sum(confs))
+                confidence_count += len(confs)
             mean_conf = mean(confs) if confs else None
             vehicle_count = len(detections)
             tracked_count = len({d["track_id"] for d in detections if d["track_id"] is not None})
@@ -336,10 +346,17 @@ def process_video_job(video_id: str) -> None:
                 if job:
                     job.current_frame = frame_index
                     job.processed_frames = processed_index
+                    job.chunk_cursor_frame = frame_index + 1
                     job.progress_percent = min(99.0, (frame_index + 1) * 100 / total_frames) if total_frames else 0.0
                     job.max_vehicle_count = max_vehicles
-                    job.avg_confidence = mean(confidence_values) if confidence_values else None
+                    job.confidence_total = confidence_total
+                    job.confidence_sample_count = confidence_count
+                    job.avg_confidence = (confidence_total / confidence_count) if confidence_count else None
                 db.commit()
+                # Survives a crash: reap_stale() only touches jobs that stopped
+                # extending this lease.
+                if not job_claim.heartbeat(db, video_id, owner):
+                    raise RuntimeError("Lost the analysis lease; another worker owns this job.")
         if processed_index == 0:
             raise ValueError("No readable frames were processed from this video.")
         if samples_to_save:
@@ -389,11 +406,14 @@ def process_video_job(video_id: str) -> None:
             job.current_frame = max(frame_index, 0)
             job.processed_frames = processed_index
             job.max_vehicle_count = max_vehicles
-            job.avg_confidence = mean(confidence_values) if confidence_values else None
+            job.confidence_total = confidence_total
+            job.confidence_sample_count = confidence_count
+            job.avg_confidence = (confidence_total / confidence_count) if confidence_count else None
             job.processed_video_path = str(output_path)
             job.preview_path = str(preview_path) if preview_path.exists() else job.preview_path
             job.completed_at = datetime.now(timezone.utc)
             db.commit()
+            job_claim.release(db, video_id, owner)
             record_activity(db, "system", "analysis.completed", "video", video_id, f"{processed_index} samples, peak {max_vehicles} vehicles")
             _notify_quietly(db, job)
         logger.info("Processed video %s: %s samples in %.1fs", video_id, processed_index, time.monotonic() - started)
@@ -404,9 +424,11 @@ def process_video_job(video_id: str) -> None:
             job = db.get(VideoJob, video_id)
             if job:
                 job.status = "failed"
-                job.error_message = f"{type(exc).__name__}: {exc}"[:2000]
+                # Path-free, viewer-safe summary; the full traceback is in the log.
+                job.error_message = sanitize_error_message(exc)
                 job.completed_at = datetime.now(timezone.utc)
                 db.commit()
+                job_claim.release(db, video_id, owner)
                 record_activity(db, "system", "analysis.failed", "video", video_id, job.error_message[:200])
                 _notify_quietly(db, job)
         except Exception:

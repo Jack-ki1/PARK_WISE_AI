@@ -11,11 +11,18 @@ a ticket that is:
 
 Used by ``/api/ws/streams/{id}`` (live frames) and ``/api/ws/videos/{id}``
 (job progress).
+
+Deployment note: the store is an in-process dict (lock-protected, so redemption
+is single-use across the threadpool), which assumes a **single worker process**.
+That matches the rest of the runtime — stream sessions and rate-limit buckets
+are also in-memory — so ``uvicorn --workers N`` or horizontally scaled replicas
+are unsupported until this store (and those) move to shared state.
 """
 
 from __future__ import annotations
 
 import secrets
+import threading
 import time
 from typing import Dict
 
@@ -24,6 +31,10 @@ MAX_TICKETS = 1000
 
 # {ticket: {"kind": str, "object_id": str, "expires_at": float}}
 _tickets: Dict[str, dict] = {}
+# Ticket redemption runs on the threadpool (one thread per WebSocket handshake), so
+# the check-and-consume below must not interleave — without this lock two simultaneous
+# redemptions of one ticket both see it present and both pass.
+_lock = threading.Lock()
 
 
 def _purge_expired() -> None:
@@ -40,9 +51,10 @@ def _purge_expired() -> None:
 
 
 def create_ticket(kind: str, object_id: str) -> str:
-    _purge_expired()
-    ticket = f"ws_{secrets.token_urlsafe(32)}"
-    _tickets[ticket] = {"kind": kind, "object_id": str(object_id), "expires_at": time.time() + TTL_SECONDS}
+    with _lock:
+        _purge_expired()
+        ticket = f"ws_{secrets.token_urlsafe(32)}"
+        _tickets[ticket] = {"kind": kind, "object_id": str(object_id), "expires_at": time.time() + TTL_SECONDS}
     return ticket
 
 
@@ -53,17 +65,22 @@ def validate_ticket(ticket: str | None, kind: str, object_id: str) -> bool:
     different object is refused but left in the store (it may still be redeemed
     against the object it was minted for).
     """
-    if not ticket or ticket not in _tickets:
+    if not ticket:
         return False
-    data = _tickets[ticket]
-    if time.time() > data["expires_at"]:
-        del _tickets[ticket]
-        return False
-    if data["kind"] != kind or data["object_id"] != str(object_id):
-        return False
-    del _tickets[ticket]
+    with _lock:
+        # pop() is the consume: whoever takes it owns it, exactly once.
+        data = _tickets.pop(ticket, None)
+        if data is None:
+            return False
+        if time.time() > data["expires_at"]:
+            return False
+        if data["kind"] != kind or data["object_id"] != str(object_id):
+            # Not ours; put it back so its real holder can redeem it.
+            _tickets[ticket] = data
+            return False
     return True
 
 
 def clear() -> None:
-    _tickets.clear()
+    with _lock:
+        _tickets.clear()

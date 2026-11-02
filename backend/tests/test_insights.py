@@ -33,6 +33,9 @@ def _seed_reviewed_video() -> str:
         state="occupied",
     )
     session.add(space)
+    # OccupancySample has no ORM relationship to ParkingSpace, so the unit of work
+    # cannot order the two inserts on its own; flush so the bay row exists first.
+    session.flush()
     for index, state in enumerate(["occupied", "occupied", "free"]):
         session.add(
             OccupancySample(

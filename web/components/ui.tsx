@@ -1,7 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useRef } from "react";
-import type { MouseEvent, ReactNode } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
+import type { KeyboardEvent as ReactKeyboardEvent, MouseEvent, ReactNode } from "react";
 import type { LucideIcon } from "lucide-react";
 import { ArrowRight, Database, FileVideo, LoaderCircle, Play, Trash2 } from "lucide-react";
 import { fmtDuration, fmtNum, statusClass, statusLabel, type VideoJob } from "@/lib/data";
@@ -95,10 +95,24 @@ export function JobsTable({ videos, onSelect, onAnalyze, onDelete, processingId,
   );
 }
 
-/** Click-to-draw polygon editor over a preview frame (used for videos and live snapshots). */
-export function CalibrationCanvas({ imageSrc, spaces, pending, onAddPoint }: { imageSrc: string; spaces: { name: string; polygon: number[][]; state?: string }[]; pending: number[][]; onAddPoint: (point: number[]) => void }) {
+/** Click-to-draw polygon editor over a preview frame (used for videos and live snapshots).
+ *  Keyboard-operable: arrow keys move an on-canvas cursor, Enter/Space places a
+ *  point, Backspace/Delete removes the last point and Escape clears the pending
+ *  polygon (via the optional callbacks wired by the dashboard). */
+export function CalibrationCanvas({ imageSrc, spaces, pending, onAddPoint, onUndoPoint, onClearPoints }: {
+  imageSrc: string;
+  spaces: { name: string; polygon: number[][]; state?: string }[];
+  pending: number[][];
+  onAddPoint: (point: number[]) => void;
+  onUndoPoint?: () => void;
+  onClearPoints?: () => void;
+}) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imgRef = useRef<HTMLImageElement | null>(null);
+  const instructionsId = `${useId().replace(/:/g, "")}-calib-instructions`;
+  // Normalized (0..1) position of the keyboard placement cursor.
+  const [cursor, setCursor] = useState<[number, number]>([0.5, 0.5]);
+  const [keyboardActive, setKeyboardActive] = useState(false);
   const paint = useCallback(() => {
     const canvas = canvasRef.current, image = imgRef.current;
     if (!canvas || !image) return;
@@ -121,7 +135,17 @@ export function CalibrationCanvas({ imageSrc, spaces, pending, onAddPoint }: { i
         ctx.fillStyle = "#fff"; ctx.font = `bold ${Math.max(12, canvas.width / 100)}px sans-serif`; ctx.fillText(String(i + 1), x * canvas.width + 6, y * canvas.height - 4);
       });
     }
-  }, [spaces, pending]);
+    if (keyboardActive) {
+      const [cx, cy] = [cursor[0] * canvas.width, cursor[1] * canvas.height];
+      const radius = Math.max(7, canvas.width / 110);
+      ctx.strokeStyle = "#f59e0b"; ctx.lineWidth = Math.max(2, canvas.width / 700);
+      ctx.beginPath(); ctx.arc(cx, cy, radius, 0, Math.PI * 2); ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(cx - radius * 1.7, cy); ctx.lineTo(cx + radius * 1.7, cy);
+      ctx.moveTo(cx, cy - radius * 1.7); ctx.lineTo(cx, cy + radius * 1.7);
+      ctx.stroke();
+    }
+  }, [spaces, pending, cursor, keyboardActive]);
   const paintRef = useRef(paint);
   useEffect(() => { paintRef.current = paint; }, [paint]);
   useEffect(() => { paint(); }, [paint]);
@@ -136,5 +160,47 @@ export function CalibrationCanvas({ imageSrc, spaces, pending, onAddPoint }: { i
     const y = Math.min(1, Math.max(0, (event.clientY - rect.top) / rect.height));
     onAddPoint([Number(x.toFixed(5)), Number(y.toFixed(5))]);
   };
-  return <canvas className="calibration-canvas" ref={canvasRef} onClick={handleClick} aria-label="Click around a parking bay to draw its polygon" />;
+  const handleKeyDown = (event: ReactKeyboardEvent<HTMLCanvasElement>) => {
+    const step = 0.05; // 5% of the frame per arrow press
+    const clamp = (value: number) => Math.min(1, Math.max(0, Number(value.toFixed(5))));
+    const { key } = event;
+    if (key === "ArrowLeft" || key === "ArrowRight" || key === "ArrowUp" || key === "ArrowDown") {
+      event.preventDefault();
+      setKeyboardActive(true);
+      setCursor(([x, y]) => [
+        key === "ArrowLeft" ? clamp(x - step) : key === "ArrowRight" ? clamp(x + step) : x,
+        key === "ArrowUp" ? clamp(y - step) : key === "ArrowDown" ? clamp(y + step) : y,
+      ]);
+    } else if (key === "Enter" || key === " ") {
+      event.preventDefault();
+      setKeyboardActive(true);
+      onAddPoint([cursor[0], cursor[1]]);
+    } else if (key === "Backspace" || key === "Delete") {
+      event.preventDefault();
+      onUndoPoint?.();
+    } else if (key === "Escape") {
+      event.preventDefault();
+      onClearPoints?.();
+    }
+  };
+  return (
+    <>
+      <canvas
+        className="calibration-canvas"
+        ref={canvasRef}
+        onClick={handleClick}
+        onKeyDown={handleKeyDown}
+        onBlur={() => setKeyboardActive(false)}
+        tabIndex={0}
+        role="application"
+        aria-label="Bay polygon editor"
+        aria-describedby={instructionsId}
+      />
+      <span id={instructionsId} className="sr-only">
+        Interactive polygon editor. Press the arrow keys to move the placement cursor in five-percent steps,
+        Enter or Space to place a point at the cursor, Backspace or Delete to remove the last point,
+        and Escape to clear the pending polygon. Mouse clicks also place points.
+      </span>
+    </>
+  );
 }

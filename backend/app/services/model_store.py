@@ -13,16 +13,24 @@
 from __future__ import annotations
 
 import threading
+import time
 
 _MODEL_CACHE: dict[str, object] = {}
 _STREAM_MODEL_CACHE: dict[str, object] = {}
+# Last-touch time per key: eviction is LRU, so a model that a live stream is using
+# every second cannot be dropped out from under its ByteTrack state.
+_USED_AT: dict[str, float] = {}
 _LOCK = threading.Lock()
+# Weights load once per key; the lock is per key so a slow first load cannot stall
+# unrelated requests (previously the whole app waited on the global lock).
+_BUILDING: dict[str, threading.Lock] = {}
 
 # Serializes every model.track/model.predict call (batch and live).
 INFERENCE_LOCK = threading.Lock()
 
 # Bounded per-stream instance cache (each instance holds its own tracker state).
 MAX_STREAM_MODELS = 6
+MAX_MODELS = 4
 
 
 def _load_model(name: str, device: str):
@@ -37,19 +45,43 @@ def _load_model(name: str, device: str):
     return model
 
 
+def _get_or_build(cache: dict[str, object], key: str, builder) -> object:
+    with _LOCK:
+        cached = cache.get(key)
+        if cached is not None:
+            _USED_AT[key] = time.monotonic()
+            return cached
+        build_lock = _BUILDING.setdefault(key, threading.Lock())
+
+    # Loading happens outside _LOCK; only one thread builds a given key.
+    with build_lock:
+        with _LOCK:
+            cached = cache.get(key)
+            if cached is not None:
+                _USED_AT[key] = time.monotonic()
+                return cached
+        model = builder()
+        with _LOCK:
+            _evict_locked(cache)
+            cache[key] = model
+            _USED_AT[key] = time.monotonic()
+            _BUILDING.pop(key, None)
+        return model
+
+
+def _evict_locked(cache: dict[str, object]) -> None:
+    limit = MAX_STREAM_MODELS if cache is _STREAM_MODEL_CACHE else MAX_MODELS
+    while len(cache) >= limit:
+        coldest = min(cache, key=lambda k: _USED_AT.get(k, 0.0))
+        cache.pop(coldest, None)
+        _USED_AT.pop(coldest, None)
+
+
 def get_model(name: str, device: str = "auto"):
     """Load (and cache) an ultralytics model by weight filename. Import happens lazily so
     tests and the API can start without the CV stack installed."""
     key = f"{name}|{device}"
-    with _LOCK:
-        cached = _MODEL_CACHE.get(key)
-        if cached is not None:
-            return cached
-        model = _load_model(name, device)
-        if len(_MODEL_CACHE) > 4:  # bounded cache
-            _MODEL_CACHE.pop(next(iter(_MODEL_CACHE)))
-        _MODEL_CACHE[key] = model
-        return model
+    return _get_or_build(_MODEL_CACHE, key, lambda: _load_model(name, device))
 
 
 def get_stream_model(name: str, device: str, stream_id: str):
@@ -59,15 +91,7 @@ def get_stream_model(name: str, device: str, stream_id: str):
     returned instance only for that stream's frames, always inside INFERENCE_LOCK.
     """
     key = f"{name}|{device}|stream:{stream_id}"
-    with _LOCK:
-        cached = _STREAM_MODEL_CACHE.get(key)
-        if cached is not None:
-            return cached
-        model = _load_model(name, device)
-        if len(_STREAM_MODEL_CACHE) >= MAX_STREAM_MODELS:
-            _STREAM_MODEL_CACHE.pop(next(iter(_STREAM_MODEL_CACHE)))
-        _STREAM_MODEL_CACHE[key] = model
-        return model
+    return _get_or_build(_STREAM_MODEL_CACHE, key, lambda: _load_model(name, device))
 
 
 def drop_stream_models(stream_id: str) -> None:
@@ -76,3 +100,4 @@ def drop_stream_models(stream_id: str) -> None:
     with _LOCK:
         for key in [k for k in _STREAM_MODEL_CACHE if k.endswith(suffix)]:
             _STREAM_MODEL_CACHE.pop(key, None)
+            _USED_AT.pop(key, None)

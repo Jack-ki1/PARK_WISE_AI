@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { ChangeEvent, FormEvent } from "react";
+import type { ChangeEvent, FormEvent, KeyboardEvent as ReactKeyboardEvent } from "react";
 import type { LucideIcon } from "lucide-react";
 import {
   Activity, AlertTriangle, ArrowRight, Building2, CalendarDays, Check, ChevronDown, CircleHelp,
@@ -14,7 +14,7 @@ import { BarChart, ChartCard, DetectionChart, Donut, HBarChart, ShareBar, Sparkl
 import { CalibrationCanvas, EmptyTable, Fact, JobsTable, MetricCard, PanelHeader } from "@/components/ui";
 import SiteMap from "@/components/sitemap";
 import {
-  API, api, confFmt, downloadFile, fmtDuration, fmtNum, fmtTime, getApiKey, setSessionApiKey, statusClass,
+  API, APP_VERSION, api, confFmt, downloadFile, fmtDuration, fmtNum, fmtTime, getApiKey, setSessionApiKey, statusClass,
   statusLabel, streamSocketUrl, useTheme, videoSocketUrl, MAX_POLYGON_POINTS,
   type ActivityItem, type AnalyticsPayload, type BillingReport, type LiveEvent, type LiveFrame,
   type OccupancyPoint, type OccupancySeries, type Point, type PublicConfig, type ReviewedVideo,
@@ -40,6 +40,35 @@ const settingsTabs: { id: SettingsTabId; label: string; icon: LucideIcon }[] = [
   { id: "billing", label: "Billing", icon: CreditCard },
   { id: "system", label: "System", icon: ShieldCheck },
 ];
+
+const ANALYSIS_MODES: AnalysisMode[] = ["live", "recorded"];
+const STREAM_KINDS: ("url" | "video")[] = ["url", "video"];
+const SETTINGS_TAB_IDS: SettingsTabId[] = settingsTabs.map(tab => tab.id);
+
+/** Shared roving-tabindex arrow-key wiring for the page's tab lists
+ *  (APG automatic activation: arrows/Home/End select and move focus). */
+function tabListKeyDown<T extends string>(
+  event: ReactKeyboardEvent<HTMLElement>,
+  tabs: readonly T[],
+  activeId: T,
+  onSelect: (id: T) => void,
+) {
+  const index = tabs.indexOf(activeId);
+  if (index < 0) return;
+  let next = index;
+  if (event.key === "ArrowRight" || event.key === "ArrowDown") next = (index + 1) % tabs.length;
+  else if (event.key === "ArrowLeft" || event.key === "ArrowUp") next = (index - 1 + tabs.length) % tabs.length;
+  else if (event.key === "Home") next = 0;
+  else if (event.key === "End") next = tabs.length - 1;
+  else return;
+  event.preventDefault();
+  onSelect(tabs[next]);
+  // currentTarget is only valid during dispatch: capture the list before the rAF.
+  const list = event.currentTarget;
+  requestAnimationFrame(() => {
+    list.querySelector<HTMLElement>(`[data-tab-id="${tabs[next]}"]`)?.focus();
+  });
+}
 
 const pageMeta: Record<PageId, { eyebrow: string; title: string; subtitle: string }> = {
   dashboard: {
@@ -98,6 +127,9 @@ export default function HomePage() {
   const [streams, setStreams] = useState<StreamRow[]>([]);
   const [selectedStreamId, setSelectedStreamId] = useState("");
   const [watchId, setWatchId] = useState("");
+  // Bumped on every Watch click so re-watching the same stream restarts the
+  // connect effect even though watchId itself is unchanged.
+  const [watchSession, setWatchSession] = useState(0);
   const [liveFrame, setLiveFrame] = useState<LiveFrame | null>(null);
   const [wsStatus, setWsStatus] = useState<"idle" | "connecting" | "live" | "error">("idle");
   const [liveEvents, setLiveEvents] = useState<LiveEvent[]>([]);
@@ -211,7 +243,17 @@ export default function HomePage() {
     [],
   );
 
-  const refreshData = useCallback((quiet = false) => Promise.all([
+  // Monotonic refresh generation: every refreshData call claims a generation
+  // and only the newest one may apply its snapshot, so an overlapping (stale)
+  // response can never clobber fresher state. The in-flight flag additionally
+  // lets the 5s poll skip a tick instead of stacking requests.
+  const refreshGenRef = useRef(0);
+  const refreshBusyRef = useRef(false);
+  const refreshData = useCallback((quiet = false) => {
+    const generation = ++refreshGenRef.current;
+    const isCurrent = () => generation === refreshGenRef.current;
+    refreshBusyRef.current = true;
+    return Promise.all([
     api<{ status: string }>("/api/health"),
     api<Summary>("/api/dashboard/summary"),
     api<VideoJob[]>("/api/videos"),
@@ -221,6 +263,7 @@ export default function HomePage() {
     api<{ items: ActivityItem[] }>("/api/activity?limit=200").catch(() => ({ items: [] as ActivityItem[] })),
     api<{ items: StreamRow[] }>("/api/streams").catch(() => ({ items: [] as StreamRow[] })),
   ]).then(([health, nextSummary, nextVideos, nextSources, nextConfig, nextDash, nextActivity, nextStreams]) => {
+    if (!isCurrent()) return; // superseded by a newer refresh: discard this snapshot
     setApiStatus(health.status === "ok" ? "online" : "offline");
     setSummary(nextSummary);
     setVideos(nextVideos);
@@ -232,12 +275,16 @@ export default function HomePage() {
     setSelectedId(current => current && nextVideos.some(v => v.id === current) ? current : (nextSummary.latest_video_id || nextVideos[0]?.id || ""));
     if (!quiet) setMessage(current => current?.tone === "error" ? current : null);
   }, (err) => {
+    if (!isCurrent()) return;
     // A background poll that fails is a transport blip, not a data reset: keep
     // the last known rows on screen and only flip the status chip. Repeating
     // the full "Could not reach the API" toast every 5s would bury real errors.
     setApiStatus("offline");
     if (!quiet) setMessage({ tone: "error", text: err instanceof Error ? err.message : "Could not reach the API" });
-}), []);
+  }).finally(() => {
+    if (isCurrent()) refreshBusyRef.current = false;
+  });
+}, []);
 
   const refreshAdmin = useCallback(() => Promise.all([
     api<SettingsPayload>("/api/settings"),
@@ -280,8 +327,9 @@ export default function HomePage() {
   useEffect(() => {
     refreshData();
     // Eight GETs every 5s: pause them while the tab is in the background and
-    // refresh immediately again when the operator comes back.
-    const load = () => { if (!document.hidden) refreshData(true); };
+    // refresh immediately again when the operator comes back. A tick whose
+    // previous cycle is still in flight is skipped (see refreshData guard).
+    const load = () => { if (!document.hidden && !refreshBusyRef.current) refreshData(true); };
     const timer = setInterval(load, 5000);
     const onVisible = () => { if (!document.hidden) refreshData(true); };
     document.addEventListener("visibilitychange", onVisible);
@@ -314,25 +362,32 @@ export default function HomePage() {
 
   // Live frame WebSocket: connects only while Live Analysis is open and a stream is watched.
   // Auth uses a short-lived single-use ticket (never a durable API key in the URL).
+  // Drops reconnect with capped exponential backoff (1s, 2s, 4s … 15s), re-minting
+  // a fresh single-use ticket each attempt. Reconnect stops on unmount, when the
+  // watched stream/session changes, when the operator stops watching, and on
+  // auth-type close codes (4401/1008) which are surfaced instead of retried.
   useEffect(() => {
     if (activePage !== "live" || !watchId) return;
     let socket: WebSocket | null = null;
     let cancelled = false;
-    (async () => {
-      let url: string;
-      try {
-        url = await streamSocketUrl(watchId);
-      } catch (err) {
-        if (!cancelled) {
-          setWsStatus("error");
-          setMessage({ tone: "error", text: err instanceof Error ? err.message : "Could not authorize the stream connection." });
-        }
-        return;
-      }
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let attempt = 0;
+    const MAX_RETRY_DELAY_MS = 15000;
+    const connect = async () => {
       if (cancelled) return;
       setWsStatus("connecting");
+      let url: string;
+      try {
+        url = await streamSocketUrl(watchId); // fresh single-use ticket per attempt
+      } catch (err) {
+        if (cancelled) return;
+        setWsStatus("error");
+        setMessage({ tone: "error", text: err instanceof Error ? err.message : "Could not authorize the stream connection." });
+        return; // ticket/auth failures are surfaced, not retried
+      }
+      if (cancelled) return;
       socket = new WebSocket(url);
-      socket.onopen = () => setWsStatus("live");
+      socket.onopen = () => { attempt = 0; setWsStatus("live"); };
       socket.onmessage = event => {
         try {
           const msg = JSON.parse(event.data) as Partial<LiveFrame> & { type: string };
@@ -356,10 +411,26 @@ export default function HomePage() {
         } catch { /* Ignore malformed frames; the next one replaces them. */ }
       };
       socket.onerror = () => setWsStatus("error");
-      socket.onclose = () => setWsStatus(current => current === "error" ? "error" : "idle");
-    })();
-    return () => { cancelled = true; socket?.close(); };
-  }, [activePage, watchId]);
+      socket.onclose = event => {
+        if (cancelled) return;
+        if (event.code === 4401 || event.code === 1008) {
+          setWsStatus("error");
+          setMessage({ tone: "error", text: "The stream connection was rejected by the server (authentication). Press Watch to reconnect with a fresh ticket." });
+          return; // auth closures are surfaced, never hammered
+        }
+        setWsStatus(current => current === "error" ? "error" : "idle");
+        const delay = Math.min(1000 * 2 ** attempt, MAX_RETRY_DELAY_MS);
+        attempt += 1;
+        retryTimer = setTimeout(connect, delay);
+      };
+    };
+    connect();
+    return () => {
+      cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      socket?.close();
+    };
+  }, [activePage, watchId, watchSession]);
 
   const handleUpload = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]; if (!file) return;
@@ -539,11 +610,18 @@ export default function HomePage() {
   const watchStream = (stream: StreamRow) => {
     setSelectedStreamId(stream.id);
     setWatchId(stream.id);
+    setWatchSession(session => session + 1); // re-clicking Watch restarts the socket even for the same stream
     setWsStatus("connecting");
     setLiveFrame(null);
     setLiveEvents([]);
   };
   const unwatchStream = () => { setWatchId(""); setLiveFrame(null); setLiveEvents([]); };
+
+  /** Selecting the "Recorded" mode also stops any running live recording. */
+  const selectAnalysisMode = (mode: AnalysisMode) => {
+    if (mode === "recorded" && recording) stopRecording();
+    setAnalysisMode(mode);
+  };
 
   /** Composite the incoming annotated frames into a downloadable clip. */
   const startRecording = () => {
@@ -648,10 +726,22 @@ export default function HomePage() {
 
   const exportReport = () => {
     const rows = dash?.reviewed_videos ?? [];
-    const header = ["video_id", "name", "completed_at", "duration_seconds", "peak_vehicles", "avg_confidence", "samples", "occupied_share_percent"];
+    // Explicit column map: ReviewedVideo stores the identifier as `id`, so the
+    // exported "video_id" column must read row.id (it used to index a
+    // non-existent video_id field and always came out empty).
+    const columns: { header: string; value: (row: ReviewedVideo) => string | number | null }[] = [
+      { header: "video_id", value: row => row.id },
+      { header: "name", value: row => row.name },
+      { header: "completed_at", value: row => row.completed_at },
+      { header: "duration_seconds", value: row => row.duration_seconds },
+      { header: "peak_vehicles", value: row => row.peak_vehicles },
+      { header: "avg_confidence", value: row => row.avg_confidence },
+      { header: "samples", value: row => row.samples },
+      { header: "occupied_share_percent", value: row => row.occupied_share_percent },
+    ];
     const lines = [
-      header.join(","),
-      ...rows.map(row => header.map(key => JSON.stringify((row as unknown as Record<string, string | number | null>)[key] ?? "")).join(",")),
+      columns.map(column => column.header).join(","),
+      ...rows.map(row => columns.map(column => JSON.stringify(column.value(row) ?? "")).join(",")),
     ];
     const url = URL.createObjectURL(new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8" }));
     const anchor = document.createElement("a");
@@ -798,7 +888,7 @@ export default function HomePage() {
         <div className="sidebar-bottom">
           <div className="edge-status"><div className="edge-status-top"><span className={`status-dot ${apiStatus === "online" ? "online" : apiStatus === "offline" ? "offline" : ""}`} /><strong>API connection</strong><span className="edge-status-value">{apiStatus === "online" ? "Connected" : apiStatus === "offline" ? "Offline" : "Checking"}</span></div><div className="edge-status-desc">{apiStatus === "online" ? "Measurements persist to the configured database." : apiStatus === "offline" ? "Start the FastAPI service to load real records." : "Checking API health…"}</div></div>
           <div className="profile-row"><div className="profile-avatar">PW</div><div className="profile-text"><strong>Operator</strong><span>Local administrator</span></div><button className="icon-btn" title="Settings" onClick={() => { setActivePage("settings"); setMobileNav(false); }}><SlidersHorizontal size={16} /></button></div>
-          <div className="side-footer">PARKWISE AI <span>v2.0.0 · PILOT</span></div>
+          <div className="side-footer">PARKWISE AI <span>v{APP_VERSION} · PILOT</span></div>
         </div>
       </aside>
 
@@ -967,16 +1057,24 @@ export default function HomePage() {
 
           {/* ----------------------------------------------------- LIVE ANALYSIS */}
           {activePage === "live" && <>
-            <div className="mode-switch" role="tablist" aria-label="Review mode">
-              <button role="tab" aria-selected={analysisMode === "live"} className={analysisMode === "live" ? "active" : ""} onClick={() => setAnalysisMode("live")}>
+            <div className="mode-switch" role="tablist" aria-label="Review mode"
+              onKeyDown={event => tabListKeyDown(event, ANALYSIS_MODES, analysisMode, selectAnalysisMode)}>
+              <button type="button" role="tab" id="mode-tab-live" data-tab-id="live"
+                aria-selected={analysisMode === "live"} aria-controls="mode-panel-live"
+                tabIndex={analysisMode === "live" ? 0 : -1}
+                className={analysisMode === "live" ? "active" : ""} onClick={() => selectAnalysisMode("live")}>
                 <RadioTower size={15} /> Live video review
               </button>
-              <button role="tab" aria-selected={analysisMode === "recorded"} className={analysisMode === "recorded" ? "active" : ""} onClick={() => { if (recording) stopRecording(); setAnalysisMode("recorded"); }}>
+              <button type="button" role="tab" id="mode-tab-recorded" data-tab-id="recorded"
+                aria-selected={analysisMode === "recorded"} aria-controls="mode-panel-recorded"
+                tabIndex={analysisMode === "recorded" ? 0 : -1}
+                className={analysisMode === "recorded" ? "active" : ""} onClick={() => selectAnalysisMode("recorded")}>
                 <FileVideo size={15} /> Recorded video review
               </button>
             </div>
 
-            {analysisMode === "live" && <>
+            {analysisMode === "live" && (
+            <div role="tabpanel" id="mode-panel-live" aria-labelledby="mode-tab-live">
               <div className="live-banner">
                 <div className="banner-icon"><RadioTower size={18} /></div>
                 <div className="banner-copy">
@@ -992,20 +1090,27 @@ export default function HomePage() {
                 <form className="stream-form" onSubmit={createStream}>
                   <div className="field-group"><label htmlFor="stream-name">NAME</label><input id="stream-name" value={streamName} onChange={e => setStreamName(e.target.value)} maxLength={80} required placeholder="North gate camera" /></div>
                   <div className="field-group">
-                    <label>SOURCE TYPE</label>
-                    <div className="segmented" role="tablist" aria-label="Stream source type">
-                      <button type="button" className={streamKind === "url" ? "active" : ""} onClick={() => setStreamKind("url")}>Camera URL</button>
-                      <button type="button" className={streamKind === "video" ? "active" : ""} onClick={() => setStreamKind("video")}>Replay video</button>
+                    <label id="stream-kind-label">SOURCE TYPE</label>
+                    <div className="segmented" role="tablist" aria-labelledby="stream-kind-label"
+                      onKeyDown={event => tabListKeyDown(event, STREAM_KINDS, streamKind, setStreamKind)}>
+                      <button type="button" role="tab" id="stream-kind-tab-url" data-tab-id="url"
+                        aria-selected={streamKind === "url"} aria-controls="stream-kind-panel-url"
+                        tabIndex={streamKind === "url" ? 0 : -1}
+                        className={streamKind === "url" ? "active" : ""} onClick={() => setStreamKind("url")}>Camera URL</button>
+                      <button type="button" role="tab" id="stream-kind-tab-video" data-tab-id="video"
+                        aria-selected={streamKind === "video"} aria-controls="stream-kind-panel-video"
+                        tabIndex={streamKind === "video" ? 0 : -1}
+                        className={streamKind === "video" ? "active" : ""} onClick={() => setStreamKind("video")}>Replay video</button>
                     </div>
                   </div>
                   {streamKind === "url" ? (
-                    <div className="field-group">
+                    <div className="field-group" role="tabpanel" id="stream-kind-panel-url" aria-labelledby="stream-kind-tab-url">
                       <label htmlFor="stream-url">STREAM URL</label>
                       <input id="stream-url" value={streamUrl} onChange={e => setStreamUrl(e.target.value)} required placeholder="rtsp://192.168.1.10:554/stream" />
                       <small className="field-hint">RTSP/HTTP camera URL. Embedded credentials (user:pass@) are rejected by the API — cameras must allow anonymous LAN access or use an authenticated proxy.</small>
                     </div>
                   ) : (
-                    <div className="field-group"><label htmlFor="stream-video">UPLOADED VIDEO</label><select id="stream-video" value={streamVideoId} onChange={e => setStreamVideoId(e.target.value)} required><option value="">Select a video…</option>{videos.map(job => <option key={job.id} value={job.id}>{job.source_title || job.original_name}</option>)}</select></div>
+                    <div className="field-group" role="tabpanel" id="stream-kind-panel-video" aria-labelledby="stream-kind-tab-video"><label htmlFor="stream-video">UPLOADED VIDEO</label><select id="stream-video" value={streamVideoId} onChange={e => setStreamVideoId(e.target.value)} required><option value="">Select a video…</option>{videos.map(job => <option key={job.id} value={job.id}>{job.source_title || job.original_name}</option>)}</select></div>
                   )}
                   <div className="stream-form-row">
                     <div className="field-group"><label htmlFor="stream-fps">TARGET FPS</label><input id="stream-fps" type="number" min={1} max={15} value={streamFps} onChange={e => setStreamFps(e.target.value)} /></div>
@@ -1171,7 +1276,7 @@ export default function HomePage() {
                     <PanelHeader eyebrow="CLICK TO DRAW" title="Stream polygon editor" action={<span className="coordinate-chip">{streamPending.length} points</span>} />
                     {snapshot && snapshot.id === activeStream.id ? (
                       <div className="canvas-wrap">
-                        <CalibrationCanvas imageSrc={snapshot.url} spaces={activeStream.spaces} pending={streamPending} onAddPoint={point => addPolygonPoint(point, streamPending, next => setStreamPending(next))} />
+                        <CalibrationCanvas imageSrc={snapshot.url} spaces={activeStream.spaces} pending={streamPending} onAddPoint={point => addPolygonPoint(point, streamPending, next => setStreamPending(next))} onUndoPoint={() => setStreamPending(old => old.slice(0, -1))} onClearPoints={() => setStreamPending([])} />
                         <div className="canvas-guide"><span><i className="legend-dot red-dot" />Occupied</span><span><i className="legend-dot green-dot" />Free</span><span><i className="legend-dot grey-dot" />Unknown</span></div>
                       </div>
                     ) : (
@@ -1210,9 +1315,11 @@ export default function HomePage() {
                 </div>
               </section>
             )}
-            </>}
+            </div>
+            )}
 
-            {analysisMode === "recorded" && <>
+            {analysisMode === "recorded" && (
+            <div role="tabpanel" id="mode-panel-recorded" aria-labelledby="mode-tab-recorded">
             <div className="page-subheading" id="import-anchor">
               <div className="eyebrow"><span className="eyebrow-line" />INDEPENDENT VIDEO ANALYSIS</div>
               <h2>Uploaded & public footage</h2>
@@ -1315,7 +1422,7 @@ export default function HomePage() {
                 <PanelHeader eyebrow="CLICK TO DRAW" title="Bay polygon editor" action={<span className="coordinate-chip">{pendingPoints.length} points</span>} />
                 {selected?.preview_url ? (
                   <div className="canvas-wrap">
-                    <CalibrationCanvas imageSrc={`${API}${selected.preview_url}`} spaces={spaces} pending={pendingPoints} onAddPoint={p => addPolygonPoint(p, pendingPoints, next => updatePending(() => next))} />
+                    <CalibrationCanvas imageSrc={`${API}${selected.preview_url}`} spaces={spaces} pending={pendingPoints} onAddPoint={p => addPolygonPoint(p, pendingPoints, next => updatePending(() => next))} onUndoPoint={() => updatePending(old => old.slice(0, -1))} onClearPoints={() => updatePending(() => [])} />
                     <div className="canvas-guide"><span><i className="legend-dot red-dot" />Occupied</span><span><i className="legend-dot green-dot" />Free</span><span><i className="legend-dot grey-dot" />Unknown</span></div>
                   </div>
                 ) : (
@@ -1356,22 +1463,28 @@ export default function HomePage() {
                 <div className="calibration-caveat"><AlertTriangle size={15} /><span>Automatic bay state depends on camera angle and detector quality. “Free” is a model estimate, not a guaranteed space.</span></div>
               </section>
             </div>
-            </>}
+            </div>
+            )}
 
           </>}
 
           {/* --------------------------------------------- SETTINGS */}
           {activePage === "settings" && <>
-            <div className="settings-tabs" role="tablist" aria-label="Settings sections">
+            <div className="settings-tabs" role="tablist" aria-label="Settings sections"
+              onKeyDown={event => tabListKeyDown(event, SETTINGS_TAB_IDS, settingsTab, setSettingsTab)}>
               {settingsTabs.map(tab => (
-                <button key={tab.id} role="tab" aria-selected={settingsTab === tab.id} className={`settings-tab ${settingsTab === tab.id ? "active" : ""}`} onClick={() => setSettingsTab(tab.id)}>
+                <button key={tab.id} type="button" role="tab" id={`settings-tab-${tab.id}`} data-tab-id={tab.id}
+                  aria-selected={settingsTab === tab.id} aria-controls={`settings-panel-${tab.id}`}
+                  tabIndex={settingsTab === tab.id ? 0 : -1}
+                  className={`settings-tab ${settingsTab === tab.id ? "active" : ""}`} onClick={() => setSettingsTab(tab.id)}>
                   <tab.icon size={15} /><span>{tab.label}</span>
                 </button>
               ))}
             </div>
 
 
-            {settingsTab === "model" && <>
+            {settingsTab === "model" && (
+            <div role="tabpanel" id="settings-panel-model" aria-labelledby="settings-tab-model">
               <div className="settings-grid-2">
                 <section className="panel">
                   <PanelHeader eyebrow="INFERENCE RUNTIME" title="Model configuration"
@@ -1444,9 +1557,11 @@ export default function HomePage() {
                   <div><strong>Commercial deployment</strong><p>Review all dependency, weights, and dataset terms. Ultralytics licensing can require an Enterprise license for some proprietary commercial distributions.</p></div>
                 </div>
               </section>
-            </>}
+            </div>
+            )}
 
-            {settingsTab === "integrations" && <>
+            {settingsTab === "integrations" && (
+            <div role="tabpanel" id="settings-panel-integrations" aria-labelledby="settings-tab-integrations">
               <div className="settings-grid-2">
                 <section className="panel">
                   <PanelHeader eyebrow="EVENT DELIVERY" title="Webhooks"
@@ -1511,9 +1626,11 @@ export default function HomePage() {
                 )}
                 {locatedStreams.length === 0 && <p className="small-note">Add latitude and longitude to a stream in Live Analysis to place it on the map. Streams without coordinates simply are not pinned.</p>}
               </section>
-            </>}
+            </div>
+            )}
 
-            {settingsTab === "users" && <>
+            {settingsTab === "users" && (
+            <div role="tabpanel" id="settings-panel-users" aria-labelledby="settings-tab-users">
               <section className="panel">
                 <PanelHeader eyebrow="THIS BROWSER SESSION" title="API key access"
                   action={<span className={`status-pill ${sessionKeyActive ? "success" : "neutral"}`}><span className="status-dot" />{sessionKeyActive ? "Key active for this tab" : "No session key"}</span>} />
@@ -1588,9 +1705,11 @@ export default function HomePage() {
                 )}
                 <div className="table-note"><ShieldCheck size={14} /> Keys authenticate as <b>Authorization: Bearer pk_…</b> or <b>X-API-Key</b> on REST calls. Frame WebSockets use short-lived single-use tickets (never <b>?key=</b>). Role enforcement applies whenever a key is presented; with PARKWISE_AUTH_REQUIRED=true every request needs one. The last active admin cannot be removed.</div>
               </section>
-            </>}
+            </div>
+            )}
 
-            {settingsTab === "billing" && <>
+            {settingsTab === "billing" && (
+            <div role="tabpanel" id="settings-panel-billing" aria-labelledby="settings-tab-billing">
               <div className="system-callout"><ShieldCheck size={16} /><span><b>Local plan simulation.</b> {billingReport?.billing_note || "Plan limits are enforced locally for this self-hosted pilot. No payment processor is connected and no charges are made — listed prices are illustrative only."}</span></div>
               <div className="plans-grid">
                 {settingsPayload && Object.entries(settingsPayload.plans).map(([key, plan]) => (
@@ -1626,9 +1745,11 @@ export default function HomePage() {
                 )) : <div className="list-empty"><CreditCard size={24} /><strong>No usage data</strong></div>}
                 <p className="honesty-note"><ShieldCheck size={14} /> Quotas are enforced server-side when a meter reaches its limit (HTTP 402 with a clear message). Storage includes original videos, previews and annotated outputs.</p>
               </section>
-            </>}
+            </div>
+            )}
 
-            {settingsTab === "system" && <>
+            {settingsTab === "system" && (
+            <div role="tabpanel" id="settings-panel-system" aria-labelledby="settings-tab-system">
               <div className="system-grid">
                 <section className="panel">
                   <PanelHeader eyebrow="CONNECTIVITY" title="Service status" />
@@ -1681,7 +1802,8 @@ export default function HomePage() {
                 <div className="config-row"><span>Activity events</span><strong>{fmtNum(systemInfo?.activity_events)}</strong></div>
                 <p className="honesty-note"><ShieldCheck size={14} /> ParkWise AI performs real inference over imported footage and configured camera sources. Nothing in this panel is simulated.</p>
               </section>
-            </>}
+            </div>
+            )}
           </>}
 
           <footer className="page-footer">

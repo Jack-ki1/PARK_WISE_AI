@@ -49,11 +49,24 @@ def _seed_space_and_occupancy(video_id: str) -> str:
         state="occupied",
     )
     session.add(space)
+    # OccupancySample has no ORM relationship to ParkingSpace, so the unit of work
+    # cannot order the two inserts on its own; flush so the bay row exists first.
+    session.flush()
     session.add(OccupancySample(video_id=video_id, space_id=space.id, timestamp_seconds=0.5, state="occupied", confidence=0.9))
     session.add(OccupancySample(video_id=video_id, space_id=space.id, timestamp_seconds=1.0, state="free", confidence=None))
     session.commit()
     session.close()
     return space.id
+
+
+def _drop_video(video_id: str) -> None:
+    """Teardown helper mirroring the API: occupancy samples are keyed by bay, so they
+    go before the job (the ORM does not know that relationship)."""
+    session = SessionLocal()
+    session.query(OccupancySample).filter(OccupancySample.video_id == video_id).delete(synchronize_session=False)
+    session.delete(session.get(VideoJob, video_id))
+    session.commit()
+    session.close()
 
 
 def test_delete_video_removes_record_and_media(client):
@@ -85,9 +98,8 @@ def test_delete_video_rejects_jobs_that_are_still_processing(client):
 
     session = SessionLocal()
     assert session.get(VideoJob, video_id) is not None
-    session.delete(session.get(VideoJob, video_id))
-    session.commit()
     session.close()
+    _drop_video(video_id)
 
 
 def test_occupancy_series_is_empty_without_measured_bays(client):
@@ -96,10 +108,7 @@ def test_occupancy_series_is_empty_without_measured_bays(client):
     assert response.status_code == 200
     assert response.json() == {"items": []}
 
-    session = SessionLocal()
-    session.delete(session.get(VideoJob, video_id))
-    session.commit()
-    session.close()
+    _drop_video(video_id)
 
 
 def test_occupancy_series_returns_measured_points_with_bay_names(client):
@@ -113,10 +122,7 @@ def test_occupancy_series_returns_measured_points_with_bay_names(client):
     assert items[0]["confidence"] == 0.9
     assert items[1]["confidence"] is None
 
-    session = SessionLocal()
-    session.delete(session.get(VideoJob, video_id))
-    session.commit()
-    session.close()
+    _drop_video(video_id)
 
 
 def test_occupancy_series_unknown_video_returns_404(client):

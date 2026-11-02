@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from ..config import settings as env_settings
 from ..models import Stream, VideoJob
-from . import settings_store
+from . import settings_store, storage
 
 
 def _month_start() -> datetime:
@@ -21,13 +21,18 @@ def _month_start() -> datetime:
 
 
 def storage_bytes(db: Session) -> int:
+    """Bytes this deployment holds: object storage sums its ledger, local walks the tree."""
+    if storage.is_blob():
+        return storage.assets_bytes(db)
     root = Path(env_settings.data_dir).expanduser().resolve()
     total = 0
     for folder in ("uploads", "processed", "previews", "streams"):
         base = root / folder
         if not base.exists():
             continue
-        for path in base.iterdir():
+        # Nested layout (<category>/<video-id>/<file>) and the historical flat one
+        # both have to count, so this walks directories rather than listing files.
+        for path in base.rglob("*"):
             try:
                 if path.is_file():
                     total += os.stat(path).st_size
@@ -41,7 +46,7 @@ def usage(db: Session) -> dict:
     videos_month = (
         db.query(func.count(VideoJob.id)).filter(VideoJob.created_at >= start).scalar() or 0
     )
-    minutes_row = (
+    duration_seconds = (
         db.query(func.coalesce(func.sum(VideoJob.duration_seconds), 0.0))
         .filter(VideoJob.created_at >= start, VideoJob.status == "completed")
         .scalar()
@@ -56,7 +61,7 @@ def usage(db: Session) -> dict:
     streams = db.query(func.count(Stream.id)).scalar() or 0
     return {
         "videos_this_month": int(videos_month),
-        "analysis_minutes_this_month": round(float(minutes_row), 1),
+        "analysis_minutes_this_month": round(float(duration_seconds) / 60.0, 1),
         "storage_bytes": storage_bytes(db),
         "concurrent_jobs": int(concurrent),
         "streams": int(streams),

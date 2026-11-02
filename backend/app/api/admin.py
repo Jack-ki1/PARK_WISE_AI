@@ -32,7 +32,7 @@ def _settings_out(db: Session) -> dict:
     return {
         "settings": safe_settings,
         "schema": {
-            key: {"type": meta["type"], "choices": meta.get("choices")}
+            key: {"type": meta["type"], "choices": meta.get("choices"), "roles": settings_store.writable_roles(key)}
             for key, meta in settings_store.SETTING_SCHEMA.items()
         },
         "plans": settings_store.PLANS,
@@ -69,7 +69,9 @@ def put_settings(payload: dict, user=Depends(current_user), db: Session = Depend
         )
     
     try:
-        settings_store.set_many(db, payload)
+        settings_store.set_many(db, payload, actor_role=user.role if user else None)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from None
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
     activity.record(db, actor_name(user), "settings.updated", "settings", None, ", ".join(payload))
@@ -215,11 +217,11 @@ def get_billing(db: Session = Depends(get_db)) -> dict:
 
 @router.put("/billing", dependencies=[Depends(rate_limit)])
 def put_billing(payload: dict, user=Depends(current_user), db: Session = Depends(get_db)) -> dict:
-    require_roles(user, ["admin", "operator"])
+    require_roles(user, ["admin"])
     plan = (payload or {}).get("plan")
     if plan not in settings_store.PLANS:
         raise HTTPException(status_code=422, detail=f"plan must be one of {', '.join(settings_store.PLANS)}")
-    settings_store.set_many(db, {"plan": plan})
+    settings_store.set_many(db, {"plan": plan}, actor_role=user.role if user else None)
     activity.record(db, actor_name(user), "billing.plan_changed", "plan", plan, None)
     return _billing_report(db)
 
@@ -251,7 +253,7 @@ def system_info(db: Session = Depends(get_db)) -> dict:
             "upload_max_mb": env_settings.max_upload_mb,
             "ssrf_schemes_allowed": ["rtsp", "rtsps", "http", "https", "tcp"],
         },
-        "docs_url": "/docs",
+        "docs_url": None if env_settings.env.strip().lower() == "production" else "/docs",
         "activity_events": db.query(func.count(ActivityEvent.id)).scalar() or 0,
     }
 

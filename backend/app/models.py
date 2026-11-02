@@ -29,10 +29,22 @@ class VideoJob(Base):
     duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
     max_vehicle_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     avg_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Running mean (sum + count) instead of a per-frame list: a 30-minute run would
+    # otherwise accumulate hundreds of thousands of floats for the lifetime of the job.
+    confidence_total: Mapped[float] = mapped_column(Float, default=0.0)
+    confidence_sample_count: Mapped[int] = mapped_column(Integer, default=0)
     processed_video_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     preview_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     model_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # Execution lease (see services/job_claim.py): exactly one worker may hold a job,
+    # and a worker that dies mid-run is detectable instead of blocking the plan forever.
+    lease_owner: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    # Resumable execution: frame cursor plus ordered storage keys of written output segments.
+    chunk_cursor_frame: Mapped[int] = mapped_column(Integer, default=0)
+    segment_keys_json: Mapped[str] = mapped_column(Text, default="[]")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -130,6 +142,26 @@ class User(Base):
     api_key_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class MediaAsset(Base):
+    """Size of every object held in blob storage (see services/storage.py).
+
+    Object storage has no directory to walk, so the storage quota has to be summed
+    from these rows. ``video_id`` is deliberately not a foreign key: an object can
+    be uploaded by the browser before its job row is registered (and must be
+    deletable after the job is gone).
+    """
+
+    __tablename__ = "media_assets"
+    __table_args__ = (Index("ix_media_assets_video", "video_id"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    key: Mapped[str] = mapped_column(String(512), unique=True)
+    video_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    bytes: Mapped[int] = mapped_column(Integer, default=0)
+    content_type: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class ActivityEvent(Base):

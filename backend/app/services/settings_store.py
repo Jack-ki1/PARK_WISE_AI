@@ -147,15 +147,24 @@ SETTING_SCHEMA: dict[str, dict[str, Any]] = {
     "frame_stride": {"type": "integer", "validate": _number(1, 30, int)},
     "device": {"type": "string", "choices": DEVICE_CHOICES, "validate": _choice(DEVICE_CHOICES)},
     "multiscale": {"type": "boolean", "validate": _flag},
-    # Billing
-    "plan": {"type": "string", "choices": list(PLANS), "validate": _choice(list(PLANS))},
-    # Integrations
-    "webhook_url": {"type": "string", "validate": _url},
-    "webhook_secret": {"type": "string", "validate": _secret},
+    # Billing — admin only: these keys define the quotas every user is held to.
+    "plan": {
+        "type": "string",
+        "choices": list(PLANS),
+        "validate": _choice(list(PLANS)),
+        "roles": ["admin"],
+    },
+    # Integrations — admin only: a webhook URL redirects operator-level events (and
+    # their payloads) to a destination of the writer's choosing.
+    "webhook_url": {"type": "string", "validate": _url, "roles": ["admin"]},
+    "webhook_secret": {"type": "string", "validate": _secret, "roles": ["admin"]},
     "map_center": {"type": "array", "validate": _map_center},
     "map_style": {"type": "string", "validate": _url},
     "public_sources_enabled": {"type": "boolean", "validate": _flag},
 }
+
+# Keys a caller may write when no narrower policy is declared for that key.
+DEFAULT_WRITE_ROLES = ["admin", "operator"]
 
 DEFAULTS: dict[str, Any] = {
     "model": env_settings.model,
@@ -186,8 +195,25 @@ def get(db: Session, key: str) -> Any:
     return DEFAULTS.get(key)
 
 
-def set_many(db: Session, values: dict[str, Any]) -> dict[str, Any]:
-    """Validate and persist a partial settings patch. Raises ValueError on bad input."""
+def writable_roles(key: str) -> list[str]:
+    """Roles allowed to write one setting key (admin-only keys declare ``roles``)."""
+    meta = SETTING_SCHEMA.get(key) or {}
+    return list(meta.get("roles") or DEFAULT_WRITE_ROLES)
+
+
+def set_many(db: Session, values: dict[str, Any], actor_role: str | None = None) -> dict[str, Any]:
+    """Validate and persist a partial settings patch. Raises ValueError on bad input.
+
+    ``actor_role`` enforces the per-key write policy: passing a role that a key does
+    not allow raises PermissionError. Pass ``"admin"`` (or None, for trusted internal
+    callers such as the webhook-secret endpoint) to write admin-only keys.
+    """
+    role = actor_role or "admin"
+    forbidden = [key for key in values if role not in writable_roles(key)]
+    if forbidden:
+        raise PermissionError(
+            f"admin-only setting(s): {', '.join(sorted(forbidden))}. Ask an admin to change these."
+        )
     cleaned: dict[str, Any] = {}
     for key, value in values.items():
         schema = SETTING_SCHEMA.get(key)

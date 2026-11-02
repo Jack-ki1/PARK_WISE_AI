@@ -25,7 +25,7 @@ def clean_state():
     checks and analytics all read the database).
     """
     from app.api import ws_tickets
-    from app.security import rate_limiter
+    from app.security import auth_limiter, rate_limiter
     from app.services.live_stream import manager
 
     Base.metadata.drop_all(engine)
@@ -35,6 +35,7 @@ def clean_state():
     # Mutating routes are rate limited per API key/IP; without this the shared
     # bucket fills across tests and later cases fail with a spurious 429.
     rate_limiter._hits.clear()
+    auth_limiter._hits.clear()
     yield
     manager.shutdown()
 

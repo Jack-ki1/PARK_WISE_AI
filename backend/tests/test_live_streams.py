@@ -152,6 +152,8 @@ def test_video_backed_stream_rejects_unknown_video_but_accepts_known(client):
 
 
 def test_websocket_unknown_stream_closes_with_policy_violation(client):
-    with pytest.raises(WebSocketDisconnect):
-        with client.websocket_connect(f"/api/ws/streams/{uuid.uuid4()}"):
-            pass
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with client.websocket_connect(f"/api/ws/streams/{uuid.uuid4()}") as ws:
+            ws.receive_text()
+            ws.receive_text()
+    assert exc_info.value.code == 1008

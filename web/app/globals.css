@@ -427,3 +427,6 @@ button.status-pill{cursor:pointer}
 .bar-track{border-radius:6px}
 .bar-track i{border-radius:5px 5px 0 0}
 .mini-ring{border-top-color:#8b5cf6;border-right-color:#6366f1}
+
+/* Keyboard-operable calibration canvas: visible focus ring for keyboard users. */
+.calibration-canvas:focus-visible{outline:2px solid var(--violet);outline-offset:2px}

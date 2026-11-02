@@ -123,6 +123,10 @@ export type SystemInfo = {
 export const API = (process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000").replace(/\/$/, "");
 export const WS_BASE = API.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
 
+/** Single source of truth for the version chip in the sidebar. Kept in sync
+ *  with web/package.json (and the FastAPI backend version), both "2.0.0". */
+export const APP_VERSION = "2.0.0";
+
 /* Session-scoped API key access (Users & Access tab).
 
    The key lives in sessionStorage only — it is cleared when the browser tab
@@ -141,15 +145,23 @@ export class ApiAuthError extends Error {
 
 /** The request never produced an HTTP response: API down, wrong URL, DNS,
  *  CORS rejection or a timeout. Distinct from a 4xx/5xx so the UI can say
- *  *why* it is offline instead of a bare "Failed to fetch". */
+ *  *why* it is offline instead of a bare "Failed to fetch".
+ *  The user-facing message stays generic; the developer command hint is only
+ *  logged to the browser console (once) so it never leaks into toasts. */
+let unreachableHintLogged = false;
 export class ApiUnreachableError extends Error {
   constructor(readonly apiBase: string, readonly cause?: unknown) {
-    super(
-      `Cannot reach the API at ${apiBase}. Start the backend ` +
-        `(.venv/bin/python3 -m uvicorn app.main:app --app-dir backend) and confirm ` +
-        `NEXT_PUBLIC_API_BASE_URL matches the host and port it prints.`,
-    );
+    super(`Cannot reach the API at ${apiBase}. Check that the API is running and that NEXT_PUBLIC_API_BASE_URL points at it.`);
     this.name = "ApiUnreachableError";
+    if (typeof window !== "undefined" && !unreachableHintLogged) {
+      unreachableHintLogged = true;
+      console.error(
+        `ParkWise: API unreachable at ${apiBase}. Start the backend ` +
+          `(.venv/bin/python3 -m uvicorn app.main:app --app-dir backend) and confirm ` +
+          `NEXT_PUBLIC_API_BASE_URL matches the host and port it prints.`,
+        cause,
+      );
+    }
   }
 }
 
@@ -169,6 +181,14 @@ export function setSessionApiKey(key: string): void {
     if (key) window.sessionStorage.setItem(API_KEY_SESSION, key);
     else window.sessionStorage.removeItem(API_KEY_SESSION);
   } catch { /* storage may be unavailable (private mode) */ }
+}
+
+/** Minimal runtime shape guard: successful API responses are JSON objects or
+ *  arrays. A scalar/null payload (an HTML error page from a proxy, a gateway
+ *  hiccup, a `null` body) would otherwise crash the UI much later and far away
+ *  from the request that caused it. This is deliberately not a schema library. */
+function isJsonContainer(value: unknown): value is Record<string, unknown> | unknown[] {
+  return typeof value === "object" && value !== null;
 }
 
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
@@ -205,6 +225,9 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
       );
     }
     throw new Error(typeof payload.detail === "string" ? payload.detail : `Request failed (${response.status})`);
+  }
+  if (!isJsonContainer(payload)) {
+    throw new Error(`API returned an unexpected response shape for ${path}`);
   }
   return payload as T;
 }
@@ -312,7 +335,10 @@ export function useTheme() {
       return () => { document.removeEventListener(THEME_EVENT, emit); window.removeEventListener("storage", emit); };
     },
     readTheme,
-    () => "dark" as Theme,
+    // Server snapshot must match the layout.tsx theme bootstrap default
+    // ("light" when no stored choice exists) or React reports a hydration
+    // mismatch on first paint.
+    () => "light" as Theme,
   );
   const toggleTheme = () => {
     const next: Theme = theme === "light" ? "dark" : "light";

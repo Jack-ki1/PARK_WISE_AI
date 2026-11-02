@@ -66,7 +66,7 @@ class TestWebhookRedirectGuard:
         URL validation is bypassed here so the test isolates the redirect guard
         itself; loopback targets are rejected by validate_external_url in real runs.
         """
-        monkeypatch.setattr(integrations, "validate_external_url", lambda url, schemes=None, **kw: url)
+        monkeypatch.setattr(integrations, "pin_validated_url", lambda url, schemes=None, **kw: (url, None))
         server = HTTPServer(("127.0.0.1", 0), _RedirectHandler)
         port = server.server_address[1]
         thread = threading.Thread(target=server.serve_forever, daemon=True)

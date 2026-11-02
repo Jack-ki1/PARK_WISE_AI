@@ -274,19 +274,26 @@ async def stream_frames(websocket: WebSocket, stream_id: str) -> None:
     if env_settings.auth_required:
         ticket = websocket.query_params.get("ticket")
         if not ws_tickets.validate_ticket(ticket, "stream", stream_id):
+            # Accept before closing: closing an unaccepted socket surfaces as a
+            # bare HTTP 403 on most ASGI servers instead of the documented 4401.
             await websocket.close(
                 code=4401,
                 reason="Authentication required: request a ticket via POST /api/streams/{id}/ws-ticket",
             )
+            return
             return
 
     db = SessionLocal()
     try:
         stream = db.get(Stream, stream_id)
         if stream is None:
+            await websocket.accept()
+            await websocket.send_text(json.dumps({"type": "error", "detail": "Stream not found"}))
             await websocket.close(code=1008, reason="Stream not found")
             return
         if not stream.enabled:
+            await websocket.accept()
+            await websocket.send_text(json.dumps({"type": "error", "detail": "Stream is disabled"}))
             await websocket.close(code=1008, reason="Stream is disabled")
             return
         spaces = load_spaces(stream)

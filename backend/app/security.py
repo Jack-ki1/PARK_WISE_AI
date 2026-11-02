@@ -3,8 +3,9 @@
 - API2/API5: optional bearer API-key auth with role gates (admin/operator/viewer).
 - API1: object ownership is enforced by loading the object through route-scoped
   dependencies (see routes) rather than trusting client ids blindly.
-- API3: every response is shaped by Pydantic response models; settings writes go
-  through an allow-list schema (settings_store.SETTING_SCHEMA).
+- API3: the core read/write endpoints declare Pydantic response models, and
+  settings writes go through an allow-list schema (settings_store.SETTING_SCHEMA);
+  the remaining endpoints return explicitly constructed, schema-checked dicts.
 - API4: a per-client rate limiter for mutating requests (config.py rate_limit_per_minute).
 - API7: SSRF validation for user-supplied stream/webhook URLs (schemes, metadata hosts).
 """
@@ -13,13 +14,14 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import re
 import socket
 import threading
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Iterable
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import parse_qsl, urlparse, urlunparse
 
 from fastapi import Depends, Header, HTTPException, Request
 from sqlalchemy.orm import Session
@@ -76,6 +78,15 @@ def _address_blocked(address: ipaddress._BaseAddress, allow_private: bool, trust
         return f"multicast address {address} is not allowed"
     if address.is_unspecified:
         return f"unspecified address {address} is not allowed"
+    if address.is_reserved:
+        # Includes the IPv4 limited broadcast (255.255.255.255) and 240/4 — a
+        # target nobody legitimately points a camera or webhook at.
+        return f"reserved address {address} is not allowed"
+    if address.version == 4 and str(address).endswith(".255"):
+        # Directed broadcast of the common /24 LAN. A host that claims the
+        # subnet's broadcast address is a misconfiguration, and broadcast
+        # amplification is never a valid stream/webhook target.
+        return f"broadcast address {address} is not allowed"
     if address.is_private or (address.version == 6 and address.is_site_local):
         if not allow_private:
             return f"private address {address} is not allowed in this context"
@@ -84,20 +95,17 @@ def _address_blocked(address: ipaddress._BaseAddress, allow_private: bool, trust
     return None
 
 
-def validate_external_url(
+def _validate_and_resolve(
     url: str,
-    schemes: Iterable[str] | None = None,
-    allow_private: bool = True,
-    trusted_cidrs: str | None = None,
-) -> str:
-    """SSRF guard (API7). Returns the normalised URL or raises ValueError.
+    schemes: Iterable[str] | None,
+    allow_private: bool,
+    trusted_cidrs: str | None,
+) -> tuple[str, list[str]]:
+    """Shared SSRF check: returns (normalised URL, every validated address).
 
-    Private/CGNAT ranges are allowed by default for CCTV cameras on LANs, but
-    cloud metadata endpoints, loopback, link-local, multicast and unspecified
-    addresses are always blocked. Every resolved address of a hostname is
-    validated (DNS-rebinding defence). When ``trusted_cidrs`` (comma-separated)
-    is provided and non-empty, private addresses must fall inside one of those
-    networks; set ``allow_private=False`` to reject all private ranges (webhooks).
+    The resolved list comes back so a caller can connect to *these* addresses
+    instead of resolving the hostname again — that second lookup is the gap DNS
+    rebinding used to slip through.
     """
     text = (url or "").strip()
     if not text or len(text) > 600:
@@ -134,7 +142,7 @@ def validate_external_url(
             _check(literal.ipv4_mapped)
         else:
             _check(literal)
-        return text
+        return text, [str(literal)]
 
     # Hostname: resolve and validate ALL resolved addresses (DNS rebinding defence).
     try:
@@ -154,31 +162,119 @@ def validate_external_url(
         else:
             _check(address)
 
+    return text, resolved
+
+
+def validate_external_url(
+    url: str,
+    schemes: Iterable[str] | None = None,
+    allow_private: bool = True,
+    trusted_cidrs: str | None = None,
+) -> str:
+    """SSRF guard (API7). Returns the normalised URL or raises ValueError.
+
+    Private/CGNAT ranges are allowed by default for CCTV cameras on LANs, but
+    cloud metadata endpoints, loopback, link-local, multicast and unspecified
+    addresses are always blocked. Every resolved address of a hostname is
+    validated (DNS-rebinding defence). When ``trusted_cidrs`` (comma-separated)
+    is provided and non-empty, private addresses must fall inside one of those
+    networks; set ``allow_private=False`` to reject all private ranges (webhooks).
+    """
+    text, _ = _validate_and_resolve(url, schemes, allow_private, trusted_cidrs)
     return text
 
 
+def pin_validated_url(
+    url: str,
+    schemes: Iterable[str] | None = None,
+    allow_private: bool = True,
+    trusted_cidrs: str | None = None,
+    pin_schemes: Iterable[str] | None = None,
+) -> tuple[str, str | None]:
+    """Validate a URL and return (address-pinned URL, original hostname).
+
+    Closing the DNS-rebinding window means connecting to the address that was
+    actually validated, not to the hostname (which the HTTP client would resolve a
+    second time, potentially to an internal target). By default only plain HTTP is
+    pinned: HTTPS must keep the hostname in the URL and the TLS handshake, because
+    connecting by address breaks certificate validation — and there the
+    certificate is the check that matters. ``pin_schemes`` widens (or narrows)
+    that set — e.g. camera captures pass ``{"http", "rtsp", "tcp"}``, schemes
+    whose clients do no trustworthy certificate validation anyway. Returns
+    ``(url, None)`` when pinning does not apply.
+    """
+    text, resolved = _validate_and_resolve(url, schemes, allow_private, trusted_cidrs)
+    parsed = urlparse(text)
+    host = (parsed.hostname or "").lower()
+    try:
+        ipaddress.ip_address(host)
+        return text, None  # already an address literal
+    except ValueError:
+        pass
+    to_pin = set(pin_schemes) if pin_schemes is not None else {"http"}
+    if parsed.scheme not in to_pin or not resolved:
+        return text, None
+    address = ipaddress.ip_address(resolved[0])
+    netloc = f"[{address}]" if address.version == 6 else str(address)
+    if parsed.port:
+        netloc = f"{netloc}:{parsed.port}"
+    return urlunparse(parsed._replace(netloc=netloc)), host
+
+
 def redact_url(url: str | None) -> str | None:
-    """Return a display-safe URL with any userinfo stripped; None on parse failure."""
+    """Return a display-safe URL: userinfo stripped, query values masked, no fragment.
+
+    Only this redacted form is ever sent to clients; the full URL stays in the
+    database. Query strings used to survive verbatim, which leaked camera tokens
+    (``?token=…``) into list responses — values are now replaced with ``***``
+    while keys and structure are kept so the display stays recognizable.
+    """
     if not url:
         return url
     try:
         parsed = urlparse(url)
         if not parsed.scheme or not parsed.hostname:
             return None
-        if parsed.username or parsed.password:
-            host = parsed.hostname
-            if parsed.port:
-                host = f"{host}:{parsed.port}"
-            return urlunparse((parsed.scheme, host, parsed.path, parsed.params, parsed.query, ""))
-        return url
+        host = parsed.hostname
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+        masked_query = ""
+        if parsed.query:
+            masked_query = "&".join(f"{key}=***" for key, _ in parse_qsl(parsed.query, keep_blank_values=True))
+        return urlunparse((parsed.scheme, host, parsed.path, parsed.params, masked_query, ""))
     except Exception:
         return None
+
+
+# Absolute POSIX/Windows paths embedded in exception text (FileNotFoundError,
+# OpenCV/ffmpeg messages, tracebacks converted to strings …). Viewers must never
+# learn the server's filesystem layout from a job's error banner.
+_PATH_PATTERN = re.compile(r"(?:[A-Za-z]:\\[^\s\"']+)|(?:/(?:[\w.\-]+/)+[\w.\-]+)")
+
+
+def sanitize_error_message(exc: BaseException, *, limit: int = 300) -> str:
+    """One-line, path-free ``"ExcType: message"`` safe to return to any viewer.
+
+    The full exception text stays in the server log (callers pair this with
+    ``logger.exception``). Newlines collapse, filesystem paths are masked, and
+    the result is truncated so an error banner cannot carry a dump.
+    """
+    name = type(exc).__name__
+    text = " ".join(str(exc).split())
+    text = _PATH_PATTERN.sub("[path]", text)
+    if not text:
+        text = "unexpected error"
+    return f"{name}: {text}"[:limit]
 
 
 def authenticate(db: Session, raw_key: str | None) -> User | None:
     if not raw_key:
         return None
-    token = raw_key.removeprefix("Bearer ").strip()
+    # RFC 7235 auth-scheme names are case-insensitive: "bearer pk_…" must work.
+    parts = raw_key.split(None, 1)
+    token = parts[1].strip() if len(parts) == 2 and parts[0].lower() == "bearer" else raw_key.strip()
     if not token:
         return None
     user = db.query(User).filter(User.api_key_hash == hash_key(token)).first()
@@ -239,15 +335,16 @@ def actor_name(user: User | None) -> str:
 
 
 class RateLimiter:
-    """Fixed-window per-client limiter for mutating requests (API4/API6)."""
+    """Sliding-window per-client limiter for mutating requests (API4/API6)."""
 
     def __init__(self) -> None:
         self._hits: dict[str, list[float]] = defaultdict(list)
         self._lock = threading.Lock()
 
-    def check(self, key: str, limit: int, window_seconds: int = 60) -> None:
+    def try_consume(self, key: str, limit: int, window_seconds: int = 60) -> tuple[bool, int]:
+        """Record one hit. Returns (allowed, seconds_until_the_window_opens_up)."""
         if limit <= 0:
-            return
+            return True, 0
         now = time.monotonic()
         with self._lock:
             bucket = self._hits[key]
@@ -255,18 +352,68 @@ class RateLimiter:
             bucket[:] = [stamp for stamp in bucket if stamp > cutoff]
             if len(bucket) >= limit:
                 retry = window_seconds - int(now - bucket[0])
-                raise HTTPException(
-                    status_code=429,
-                    detail=f"Rate limit exceeded ({limit}/min); retry in {max(retry, 1)}s",
-                    headers={"Retry-After": str(max(retry, 1))},
-                )
+                return False, max(retry, 1)
             bucket.append(now)
             if len(self._hits) > 512:  # keep memory bounded
                 for stale in [k for k, v in self._hits.items() if not v or v[-1] < cutoff]:
                     self._hits.pop(stale, None)
+                if len(self._hits) > 512:
+                    # Expired-bucket cleanup alone cannot bound a flood of *fresh*
+                    # unique keys, so drop the least-recently used ones too. Losing
+                    # a bucket only grants that client a fresh window — it cannot
+                    # grow memory past the cap.
+                    overflow = len(self._hits) - 512
+                    coldest = sorted(self._hits, key=lambda k: self._hits[k][-1])[:overflow]
+                    for key_to_drop in coldest:
+                        self._hits.pop(key_to_drop, None)
+        return True, 0
+
+    def check(self, key: str, limit: int, window_seconds: int = 60) -> None:
+        allowed, retry = self.try_consume(key, limit, window_seconds)
+        if not allowed:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Rate limit exceeded ({limit}/min); retry in {retry}s",
+                headers={"Retry-After": str(retry)},
+            )
 
 
 rate_limiter = RateLimiter()
+# Key-bruteforce guard: authenticate() hits the DB on every guess, so failed
+# attempts get their own much tighter budget than ordinary API traffic.
+auth_limiter = RateLimiter()
+AUTH_LIMIT_PER_MINUTE = 30
+
+
+def client_identity(request: Request, authorization: str | None = None, x_api_key: str | None = None) -> str:
+    """Rate-limit bucket key: API key when presented, otherwise the client address.
+
+    Behind a reverse proxy every request arrives from the proxy's address, which
+    would collapse all clients into one bucket; PARKWISE_TRUSTED_PROXY_HEADER then
+    enables X-Forwarded-For / Forwarded parsing. Leave it unset unless the immediate
+    upstream is one you control, since a client can otherwise forge its own address.
+    """
+    if authorization or x_api_key:
+        return "key:" + hash_key((authorization or x_api_key))[:16]
+    return "ip:" + client_ip(request)
+
+
+def client_ip(request: Request) -> str:
+    header = env_settings.trusted_proxy_header.strip().lower()
+    if header:
+        value = request.headers.get(header)
+        if value:
+            # X-Forwarded-For is a chain; the left-most entry is the client.
+            first = value.split(",")[0].strip()
+            if first:
+                return first
+        forwarded = request.headers.get("forwarded")
+        if forwarded:
+            for part in forwarded.split(";"):
+                key, _, val = part.strip().partition("=")
+                if key.lower() == "for":
+                    return val.strip('"').split(",")[0].strip() or "unknown"
+    return request.client.host if request.client else "anonymous"
 
 
 def rate_limit(
@@ -278,9 +425,4 @@ def rate_limit(
     limit = env_settings.rate_limit_per_minute
     if limit <= 0:
         return
-    raw = authorization or x_api_key
-    if raw:
-        identity = "key:" + hash_key(raw)[:16]
-    else:
-        identity = "ip:" + (request.client.host if request.client else "anonymous")
-    rate_limiter.check(identity, limit)
+    rate_limiter.check(client_identity(request, authorization, x_api_key), limit)

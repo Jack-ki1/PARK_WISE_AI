@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
-from ..security import validate_external_url
+from ..security import pin_validated_url
 from . import settings_store
 
 ALLOWED_EVENTS = {"video.completed", "video.failed", "stream.overcrowding"}
@@ -35,6 +35,8 @@ def dispatch(db: Session, event: str, payload: dict) -> dict:
     """Best-effort POST to the configured webhook (SSRF-validated, 5s timeout, signed).
 
     Delivery failures are reported, never raised: webhooks must not break analysis.
+    A webhook is operator-supplied egress, so private/LAN ranges are rejected here
+    even though LAN addresses are legitimate camera sources elsewhere.
     """
     if event not in ALLOWED_EVENTS:
         return {"delivered": False, "error": f"unknown event '{event}'"}
@@ -42,7 +44,7 @@ def dispatch(db: Session, event: str, payload: dict) -> dict:
     if not url:
         return {"skipped": True, "reason": "no webhook configured"}
     try:
-        url = validate_external_url(url, schemes={"http", "https"})
+        url, pinned_host = pin_validated_url(url, schemes={"http", "https"}, allow_private=False)
     except ValueError as exc:
         return {"delivered": False, "error": f"blocked: {exc}"}
 
@@ -60,6 +62,9 @@ def dispatch(db: Session, event: str, payload: dict) -> dict:
         headers["X-Parkwise-Signature"] = "sha256=" + hmac.new(
             secret.encode("utf-8"), body, hashlib.sha256
         ).hexdigest()
+    if pinned_host:
+        # Connecting by address keeps name-based virtual hosting working.
+        headers["Host"] = pinned_host
 
     request = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:

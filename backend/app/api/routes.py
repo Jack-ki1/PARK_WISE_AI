@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import mimetypes
+import math
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -18,8 +20,8 @@ from ..config import settings
 from ..database import SessionLocal, get_db
 from ..models import DetectionSample, OccupancySample, ParkingSpace, Stream, VideoJob
 from ..schemas import DashboardSummary, DetectionPoint, OccupancyPoint, OccupancySeries, PublicSourceList, SourceOut, SpaceCreate, SpaceOut, VideoJobOut
-from ..security import current_user, rate_limit, require_roles
-from ..services import activity, billing, settings_store
+from ..security import actor_name, current_user, pin_validated_url, rate_limit, require_roles
+from ..services import activity, billing, job_claim, settings_store
 from ..services.live_stream import manager
 from ..services.public_sources import PUBLIC_SOURCES, list_public_sources
 from ..services.video_pipeline import inspect_video, process_video_job
@@ -27,6 +29,9 @@ from . import ws_tickets
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", dependencies=[Depends(current_user)])
+# Liveness probe stays credential-free so container healthchecks and the
+# launcher's wait-loop work when auth is enabled; it exposes only status/time.
+health_router = APIRouter(prefix="/api")
 # The job-progress WebSocket authenticates through a short-lived ticket (see ws_tickets).
 ws_router = APIRouter(prefix="/api")
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
@@ -107,7 +112,7 @@ def _make_job(path: Path, original_name: str, db: Session, *, source_type: str =
     return job
 
 
-@router.get("/health")
+@health_router.get("/health")
 def health():
     return {"status": "ok", "service": "parkwise-ai-api", "time": datetime.now(timezone.utc).isoformat()}
 
@@ -137,6 +142,9 @@ def public_sources():
 
 @router.get("/dashboard/summary", response_model=DashboardSummary)
 def dashboard_summary(db: Session = Depends(get_db)):
+    # Runtime backstop: the dashboard polls this every few seconds, so stuck
+    # queued/processing rows clear without waiting for another restart.
+    job_claim.reap_stale(db)
     total_videos = db.query(VideoJob).count()
     completed_videos = db.query(VideoJob).filter(VideoJob.status == "completed").count()
     processing_videos = db.query(VideoJob).filter(VideoJob.status.in_(["queued", "processing"])).count()
@@ -174,8 +182,13 @@ def dashboard_summary(db: Session = Depends(get_db)):
 
 
 @router.get("/videos", response_model=list[VideoJobOut])
-def list_videos(db: Session = Depends(get_db)):
-    jobs = db.query(VideoJob).order_by(VideoJob.created_at.desc()).limit(100).all()
+def list_videos(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+):
+    """Newest-first page of jobs. Default matches the old unpaginated cap (100)."""
+    jobs = db.query(VideoJob).order_by(VideoJob.created_at.desc()).offset(offset).limit(limit).all()
     return [_video_out(job, db) for job in jobs]
 
 
@@ -206,10 +219,18 @@ async def upload_video(file: UploadFile = File(...), user=Depends(current_user),
         job = _make_job(target, file.filename or target.name, db)
     except HTTPException:
         raise
-    except Exception as exc:
+    except ValueError as exc:
+        # inspect_video raises user-facing codec/format guidance; that is safe to show.
         target.unlink(missing_ok=True)
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    activity.record(db, "operator", "video.uploaded", "video", job.id, job.original_name[:120])
+    except Exception as exc:
+        target.unlink(missing_ok=True)
+        logger.exception("Could not inspect uploaded video %s", job_id)
+        raise HTTPException(
+            status_code=422,
+            detail="Could not read this video. Check the codec/container and try re-encoded H.264 MP4.",
+        ) from exc
+    activity.record(db, actor_name(user), "video.uploaded", "video", job.id, job.original_name[:120])
     return _video_out(job, db)
 
 
@@ -225,10 +246,28 @@ async def fetch_public_source(source_id: str, user=Depends(current_user), db: Se
     target = settings.data_path / "uploads" / f"{uuid.uuid4()}_{source['filename']}"
     byte_limit = settings.max_upload_mb * 1024 * 1024
     downloaded = 0
+
+    def _guard_public_hop(request: httpx.Request) -> None:
+        """Run for the initial request *and every redirect hop*.
+
+        These are public CDN links, so private/loopback/metadata targets are
+        never legitimate — a rotted link that redirects into the LAN must fail
+        closed here instead of being followed by the client.
+        """
+        pin_validated_url(str(request.url), schemes={"http", "https"}, allow_private=False)
+
     try:
+        # Validate (and pin, for plain-HTTP sources) before anything is opened;
+        # the event hook re-checks each redirect hop with the same policy.
+        source_url, _host = pin_validated_url(source["download_url"], schemes={"http", "https"}, allow_private=False)
         timeout = httpx.Timeout(connect=20, read=120, write=30, pool=20)
-        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers={"User-Agent": "ParkWiseAI/1.0 (public-footage-fetcher)"}) as client:
-            async with client.stream("GET", source["download_url"]) as response:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=timeout,
+            headers={"User-Agent": "ParkWiseAI/1.0 (public-footage-fetcher)"},
+            event_hooks={"request": [_guard_public_hop]},
+        ) as client:
+            async with client.stream("GET", source_url) as response:
                 response.raise_for_status()
                 content_type = response.headers.get("content-type", "").lower()
                 content_length = int(response.headers.get("content-length", "0") or 0)
@@ -236,27 +275,52 @@ async def fetch_public_source(source_id: str, user=Depends(current_user), db: Se
                     raise HTTPException(status_code=413, detail=f"Public video exceeds the {settings.max_upload_mb} MB limit")
                 if content_type and not ("video" in content_type or "octet-stream" in content_type):
                     raise HTTPException(status_code=415, detail=f"Expected video content, received {content_type}")
+                digest = hashlib.sha256()
                 with target.open("wb") as dest:
                     async for chunk in response.aiter_bytes(1024 * 1024):
                         downloaded += len(chunk)
                         if downloaded > byte_limit:
                             raise HTTPException(status_code=413, detail=f"Public video exceeds the {settings.max_upload_mb} MB limit")
+                        digest.update(chunk)
                         dest.write(chunk)
-        if downloaded < 100_000:
+        # Pin verification: the catalogue records the exact bytes the link served
+        # when approved. A rotted/re-encoded URL must fail here with a clear
+        # message rather than importing whatever the CDN returns today.
+        expected_sha = source.get("sha256")
+        expected_bytes = source.get("bytes")
+        if expected_sha and digest.hexdigest() != expected_sha:
+            raise ValueError(
+                "The file behind this source link changed (checksum mismatch). "
+                "The catalogue needs re-approval — see backend/app/services/public_sources.py."
+            )
+        if expected_bytes and downloaded != expected_bytes:
+            raise ValueError(
+                f"Expected {expected_bytes} bytes but received {downloaded}; "
+                "the provider changed the file behind this link."
+            )
+        if not expected_bytes and downloaded < 100_000:
             raise ValueError("Downloaded file is unexpectedly small; the public provider may have changed the link.")
         job = _make_job(target, source["filename"], db, source_type="public", source_id=source_id, source_title=source["title"], source_page=source["landing_page"])
-        activity.record(db, "operator", "video.imported", "video", job.id, source["title"][:120])
+        activity.record(db, actor_name(user), "video.imported", "video", job.id, source["title"][:120])
         return _video_out(job, db)
     except HTTPException:
         target.unlink(missing_ok=True)
         raise
-    except (httpx.HTTPError, ValueError, OSError) as exc:
+    except (httpx.HTTPError, OSError) as exc:
         target.unlink(missing_ok=True)
         logger.warning("Could not fetch approved source %s: %s", source_id, exc)
-        raise HTTPException(status_code=502, detail=f"Could not fetch public footage: {exc}") from exc
+        raise HTTPException(
+            status_code=502,
+            detail="Could not fetch public footage; the provider link may have changed. Try another source.",
+        ) from exc
+    except ValueError as exc:
+        target.unlink(missing_ok=True)
+        logger.warning("Rejected download for source %s: %s", source_id, exc)
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
         target.unlink(missing_ok=True)
-        raise HTTPException(status_code=422, detail=f"Could not inspect downloaded footage: {exc}") from exc
+        logger.exception("Could not inspect downloaded footage for %s", source_id)
+        raise HTTPException(status_code=422, detail="Could not read the downloaded footage.") from exc
 
 
 @router.get("/videos/{video_id}", response_model=VideoJobOut)
@@ -296,7 +360,7 @@ def delete_video(video_id: str, user=Depends(current_user), db: Session = Depend
     db.commit()
     for stream_id in running:
         manager.stop(stream_id)
-    activity.record(db, "operator", "video.deleted", "video", video_id, deleted_name)
+    activity.record(db, actor_name(user), "video.deleted", "video", video_id, deleted_name)
     for path in media_paths:
         if path is None:
             continue
@@ -309,10 +373,12 @@ def delete_video(video_id: str, user=Depends(current_user), db: Session = Depend
 @router.post("/videos/{video_id}/process", response_model=VideoJobOut, status_code=202, dependencies=[Depends(rate_limit)])
 def process_video(video_id: str, background_tasks: BackgroundTasks, user=Depends(current_user), db: Session = Depends(get_db)):
     require_roles(user, VIDEO_WRITERS)
-    job = _load_job(video_id, db)
-    if job.status in {"queued", "processing"}:
-        raise HTTPException(status_code=409, detail="This video is already queued or processing")
+    _load_job(video_id, db)
     billing.check_can_process(db)
+    # Atomic enqueue: a second concurrent request loses the race and sees 409 rather
+    # than handing the same job to a second worker.
+    if not job_claim.enqueue(db, video_id):
+        raise HTTPException(status_code=409, detail="This video is already queued or processing")
     # A re-run clears this video's stale measurements so the dashboard cannot double-count them.
     db.query(DetectionSample).filter(DetectionSample.video_id == video_id).delete(synchronize_session=False)
     db.query(OccupancySample).filter(OccupancySample.video_id == video_id).delete(synchronize_session=False)
@@ -320,17 +386,9 @@ def process_video(video_id: str, background_tasks: BackgroundTasks, user=Depends
         space.state = "unknown"
         space.confidence = None
         space.last_seen_seconds = None
-    job.status = "queued"
-    job.progress_percent = 0
-    job.current_frame = 0
-    job.processed_frames = 0
-    job.max_vehicle_count = None
-    job.avg_confidence = None
-    job.error_message = None
-    job.processed_video_path = None
-    job.completed_at = None
     db.commit()
-    activity.record(db, "operator", "analysis.requested", "video", video_id, job.original_name[:120])
+    job = _load_job(video_id, db)
+    activity.record(db, actor_name(user), "analysis.requested", "video", video_id, job.original_name[:120])
     background_tasks.add_task(process_video_job, video_id)
     return _video_out(job, db)
 
@@ -385,7 +443,7 @@ def create_space(video_id: str, payload: SpaceCreate, user=Depends(current_user)
     db.add(space)
     db.commit()
     db.refresh(space)
-    activity.record(db, "operator", "space.created", "space", space.id, f"{space.name} on {job.original_name[:60]}")
+    activity.record(db, actor_name(user), "space.created", "space", space.id, f"{space.name} on {job.original_name[:60]}")
     return SpaceOut(id=space.id, video_id=space.video_id, name=space.name, polygon=payload.polygon, state=space.state, confidence=space.confidence, last_seen_seconds=space.last_seen_seconds)
 
 
@@ -401,19 +459,45 @@ def delete_space(video_id: str, space_id: str, user=Depends(current_user), db: S
     db.query(OccupancySample).filter(OccupancySample.space_id == space_id).delete(synchronize_session=False)
     db.delete(space)
     db.commit()
-    activity.record(db, "operator", "space.deleted", "space", space_id, f"{space.name} on {job.original_name[:60]}")
+    activity.record(db, actor_name(user), "space.deleted", "space", space_id, f"{space.name} on {job.original_name[:60]}")
 
 
 @router.get("/videos/{video_id}/analytics", response_model=list[DetectionPoint])
-def video_analytics(video_id: str, db: Session = Depends(get_db)):
+def video_analytics(
+    video_id: str,
+    max_points: int = Query(default=5000, ge=50, le=20000),
+    db: Session = Depends(get_db),
+):
+    """Detection timeline, evenly down-sampled to ``max_points`` when longer.
+
+    A 30-minute run stores hundreds of thousands of rows; serializing them all
+    would stall the request and the browser for no visible chart detail.
+    """
     _load_job(video_id, db)
-    samples = db.query(DetectionSample).filter(DetectionSample.video_id == video_id).order_by(DetectionSample.timestamp_seconds.asc()).all()
+    samples = (
+        db.query(DetectionSample)
+        .filter(DetectionSample.video_id == video_id)
+        .order_by(DetectionSample.timestamp_seconds.asc())
+        .all()
+    )
+    total = len(samples)
+    if total > max_points:
+        stride = math.ceil(total / max_points)
+        samples = samples[::stride]
     return [DetectionPoint(timestamp_seconds=s.timestamp_seconds, frame_number=s.frame_number, vehicle_count=s.vehicle_count, tracked_vehicle_count=s.tracked_vehicle_count, mean_confidence=s.mean_confidence) for s in samples]
 
 
 @router.get("/videos/{video_id}/occupancy", response_model=OccupancySeries)
-def video_occupancy(video_id: str, db: Session = Depends(get_db)):
-    """Per-bay occupancy history measured during the last analysis run."""
+def video_occupancy(
+    video_id: str,
+    max_points: int = Query(default=10000, ge=50, le=50000),
+    db: Session = Depends(get_db),
+):
+    """Per-bay occupancy history measured during the last analysis run.
+
+    Rows are bay *transitions* (sparse by design); a defensive cap keeps a
+    pathological churn loop from serializing unbounded series.
+    """
     _load_job(video_id, db)
     rows = (
         db.query(OccupancySample, ParkingSpace.name)
@@ -422,6 +506,10 @@ def video_occupancy(video_id: str, db: Session = Depends(get_db)):
         .order_by(OccupancySample.timestamp_seconds.asc(), ParkingSpace.name.asc())
         .all()
     )
+    total = len(rows)
+    if total > max_points:
+        stride = math.ceil(total / max_points)
+        rows = rows[::stride]
     return OccupancySeries(
         items=[
             OccupancyPoint(
@@ -456,6 +544,9 @@ async def video_job_socket(websocket: WebSocket, video_id: str):
     if settings.auth_required:
         ticket = websocket.query_params.get("ticket")
         if not ws_tickets.validate_ticket(ticket, "video", video_id):
+            # Accept before closing: closing an unaccepted socket makes most ASGI
+            # servers reply a bare HTTP 403, which browsers cannot tell apart from
+            # a proxy rejecting the upgrade. The 4401 close code is the contract.
             await websocket.close(
                 code=4401,
                 reason="Authentication required: request a ticket via POST /api/videos/{id}/ws-ticket",

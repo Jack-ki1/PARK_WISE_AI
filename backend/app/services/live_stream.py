@@ -9,12 +9,16 @@ Design notes
 - Analytics follow Nvidia's gst-nvdsanalytics vocabulary (ROI filtering, overcrowding,
   direction / line-crossing) implemented in pure Python over bay polygons + track ids,
   which is the portable equivalent for a FastAPI/OpenCV deployment (no DeepStream).
-- Sources are validated by security.validate_external_url before a session starts (SSRF).
+- Sources are validated by security.validate_external_url before a session starts (SSRF),
+  and re-validated + address-pinned immediately before every connection attempt, so the
+  socket goes to the address that was checked seconds ago rather than a fresh DNS lookup
+  (DNS-rebinding TOCTOU defence).
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import random
 import threading
 import time
@@ -24,15 +28,35 @@ from typing import Any
 
 from ..config import settings as env_settings
 from ..models import Stream
+from ..security import sanitize_error_message
 from .model_store import INFERENCE_LOCK, drop_stream_models, get_stream_model
+
+logger = logging.getLogger(__name__)
 
 VEHICLE_CLASSES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 OVERCROWDING_RATIO = 0.8
 OVERCROWDING_COOLDOWN_S = 60.0
+# Schemes OpenCV/FFmpeg connects to without certificate validation we could rely
+# on, so the connection is pinned to the validated address (TLS schemes keep their
+# hostname — the certificate is the check there, same policy as webhooks).
+PINNABLE_SCHEMES = {"http", "rtsp", "tcp"}
 
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def pinned_source(url: str) -> str:
+    """Re-validate a camera URL and return an address-pinned form for connecting.
+
+    The URL was validated when it was saved, but the connect may happen hours
+    later — pinning forces the connection to the address validated *now*.
+    Raises ValueError when the URL is no longer acceptable (fail closed).
+    """
+    from ..security import pin_validated_url
+
+    pinned, _host = pin_validated_url(url, pin_schemes=PINNABLE_SCHEMES)
+    return pinned
 
 
 def point_in_polygon(point: tuple[float, float], polygon: list[list[float]]) -> bool:
@@ -52,6 +76,27 @@ def point_in_polygon(point: tuple[float, float], polygon: list[list[float]]) -> 
                 inside = not inside
         j = i
     return inside
+
+
+def normalized_centers(
+    detections: list[tuple], width: int, height: int
+) -> dict[int, tuple[float, float]]:
+    """Pixel boxes -> per-track centers in 0..1, matching the calibration polygons.
+
+    Bay polygons and the direction ROI are stored normalised (they must survive a
+    resolution change), while the detector reports pixels. Feeding pixel centres into
+    a 0..1 ray-cast never intersects: on a 1920x1080 frame x=960 is outside every
+    polygon, so every bay would report free and no event would ever fire.
+    """
+    centers: dict[int, tuple[float, float]] = {}
+    for box in detections:
+        x1, y1, x2, y2, _conf, _cls, track_id = box
+        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        centers[track_id] = (
+            cx / width if width else cx,
+            cy / height if height else cy,
+        )
+    return centers
 
 
 class BayTracker:
@@ -224,7 +269,16 @@ class StreamSession:
         max_attempts = max(0, int(env_settings.stream_max_reconnect_attempts))
         while not self.stop_event.is_set():
             self._set_status("live" if self.reconnect_attempts == 0 else "reconnecting")
-            capture = cv2.VideoCapture(self.source)
+            # Re-validate + pin per attempt: the connect must target the address
+            # validated seconds ago, not a fresh DNS lookup (rebinding defence).
+            capture_source = self.source
+            if self.kind == "url":
+                try:
+                    capture_source = pinned_source(self.source)
+                except ValueError as exc:
+                    self._fail(f"Invalid source URL: {exc}")
+                    return
+            capture = cv2.VideoCapture(capture_source)
             if not capture.isOpened():
                 capture.release()
                 self.reconnect_attempts += 1
@@ -247,13 +301,16 @@ class StreamSession:
             except Exception as exc:  # pragma: no cover - defensive: keep the manager in control
                 capture.release()
                 self.reconnect_attempts += 1
+                # Viewer-safe text (no filesystem paths): this string is persisted
+                # on the stream row and shown in the dashboard.
+                detail = sanitize_error_message(exc)
                 if self.kind != "url" or self.reconnect_attempts > max_attempts:
                     self._fail(
-                        f"{type(exc).__name__}: {exc}"
+                        detail
                         + (f" (gave up after {self.reconnect_attempts} attempts)" if self.reconnect_attempts > 1 else "")
                     )
                     return
-                self.last_error = f"{type(exc).__name__}: {exc} (attempt {self.reconnect_attempts}/{max_attempts}); retrying."
+                self.last_error = f"{detail} (attempt {self.reconnect_attempts}/{max_attempts}); retrying."
                 self._set_status("reconnecting")
                 if self.stop_event.wait(self._backoff_delay(self.reconnect_attempts)):
                     return
@@ -263,7 +320,7 @@ class StreamSession:
 
             if finished:
                 # Clean end (replay loop ended via stop/max-seconds or camera stopped for good).
-                if self.status == "live":
+                if self.status != "idle":
                     self._set_status("idle")
                 return
 
@@ -336,16 +393,20 @@ class StreamSession:
                     time.sleep(0.4)
                     continue
             failures = 0
+            # A reconnect budget is for surviving *consecutive* blips. Without this
+            # reset, five brief drops spread over a week would permanently kill a
+            # session that has been delivering frames fine in between.
+            self.reconnect_attempts = 0
             self.last_frame_monotonic = time.monotonic()
 
             detections = self._detect(frame, imgsz)
             boxes: list[dict] = []
-            centers: dict[int, tuple[float, float]] = {}
             confidences: list[float] = []
+            # Bay polygons/ROI are normalised to 0..1, the detector reports pixels.
+            frame_height, frame_width = frame.shape[:2]
+            centers = normalized_centers(detections, frame_width, frame_height)
             for box in detections:
                 x1, y1, x2, y2, conf, cls_id, track_id = box
-                cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-                centers[track_id] = (cx, cy)
                 confidences.append(conf)
                 boxes.append((x1, y1, x2, y2, conf, cls_id, track_id))
 
@@ -575,6 +636,11 @@ class StreamSession:
 
     def _fail(self, message: str) -> None:
         self.last_error = message
+        if self.stop_event.is_set():
+            # A failure observed while shutting down is not a source error —
+            # the operator stopped us. Persist "idle", not a phantom "error".
+            self._set_status("idle")
+            return
         self._set_status("error")
 
     def _set_status(self, status: str) -> None:
@@ -643,7 +709,10 @@ class StreamManager:
             session = StreamSession(stream, source, spaces, inference)
             session.explicitly_started = explicit
             self._sessions[stream.id] = session
-        session.start()
+            # Started inside the lock: spawning it after releasing would let a
+            # concurrent caller see the registered session as not-yet-alive and
+            # start a second thread on the same source.
+            session.start()
         return session
 
     def stop(self, stream_id: str, timeout: float = 5.0) -> bool:
@@ -652,8 +721,20 @@ class StreamManager:
         if session is None:
             return False
         session.stop(timeout=timeout)
+        thread = session._thread
+        if thread is not None and thread.is_alive():
+            # The worker missed the join deadline (a blocking read on a stalled
+            # socket can outlive it). Evicting its model now would reset ByteTrack
+            # IDs mid-frame; leave the model in place and let the thread write its
+            # own terminal status on the way out (_fail maps to idle once stopped).
+            logger.warning(
+                "Stream %s: worker still exiting after %.1fs join; keeping model state",
+                stream_id,
+                timeout,
+            )
+            return True
         drop_stream_models(stream_id)  # release per-stream tracker/model state
-        if session.status == "live":
+        if session.status != "idle":
             session._write_db(status="idle", error=None)
         return True
 
@@ -721,6 +802,11 @@ def snapshot_for(stream: Stream, spaces: list[dict], inference: dict[str, Any]) 
         return None
     import cv2
 
+    if stream.kind == "url":
+        try:
+            source = pinned_source(source)
+        except ValueError:
+            return None
     capture = cv2.VideoCapture(source)
     if not capture.isOpened():
         return None

@@ -33,6 +33,8 @@ models/*
 # TypeScript build artifacts
 *.tsbuildinfo
 web/tsconfig.tsbuildinfo
+# Local AI-tool settings (never shared)
+.qoder/
 # pytest media scratch dir (see backend/tests/conftest.py)
 .test-data/
 

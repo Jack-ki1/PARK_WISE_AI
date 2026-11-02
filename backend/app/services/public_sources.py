@@ -3,6 +3,11 @@
 Only these source IDs may be fetched; callers cannot supply arbitrary URLs.
 Direct MP4 locations were obtained through each Pexels page's Free download link.
 Always review the current Pexels terms before commercial redistribution.
+
+Each entry pins ``sha256`` + ``bytes`` of the exact file the link served when the
+entry was written. Direct CDN links rot (and providers re-encode in place), so
+the fetch path verifies the digest and fails with an explicit "source changed"
+error instead of importing whatever the URL now serves.
 """
 
 PUBLIC_SOURCES: dict[str, dict] = {
@@ -16,6 +21,8 @@ PUBLIC_SOURCES: dict[str, dict] = {
         "resolution": "3840×2160",
         "license_label": "Pexels Free license — verify current terms",
         "filename": "pexels-tom-fisk-parking-3848792.mp4",
+        "sha256": "86043be8630ff71344746cd69362dd25ff77e62f667246e7ca738428c673c0c0",
+        "bytes": 116666185,
     },
     "pexels-yasin-koc-tepe-27832493": {
         "title": "An Aerial View of a Parking Lot with Cars",
@@ -27,6 +34,8 @@ PUBLIC_SOURCES: dict[str, dict] = {
         "resolution": "3840×2160",
         "license_label": "Pexels Free license — verify current terms",
         "filename": "pexels-yasin-parking-27832493.mp4",
+        "sha256": "24c477c2b1a24ac251fb6bc8fe638e22ad448adfaef55c49f6fec21fbdc20db1",
+        "bytes": 155376366,
     },
     "pexels-david-pickup-28125313": {
         "title": "Crowded Parking Lot from Above",
@@ -38,6 +47,8 @@ PUBLIC_SOURCES: dict[str, dict] = {
         "resolution": "3840×2160",
         "license_label": "Pexels Free license — verify current terms",
         "filename": "pexels-david-pickup-parking-28125313.mp4",
+        "sha256": "2669831f8dc675ccae53e84121eb0fc95b4ec4a9bc753ca814e2a916d15f5824",
+        "bytes": 269275222,
     },
 }
 

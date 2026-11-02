@@ -166,7 +166,7 @@ export function Donut({ slices, ariaLabel, centerLabel, centerValue }: { slices:
             const length = lengths[index];
             return (
               <circle
-                key={slice.label}
+                key={`${slice.label}-${index}`}
                 cx="80" cy="80" r={radius}
                 fill="none"
                 style={{ stroke: SERIES[(slice.tone ?? index) % SERIES.length] }}
@@ -182,7 +182,7 @@ export function Donut({ slices, ariaLabel, centerLabel, centerValue }: { slices:
       </svg>
       <div className="donut-legend">
         {slices.map((slice, index) => (
-          <div className="legend-row" key={slice.label}>
+          <div className="legend-row" key={`${slice.label}-${index}`}>
             <i style={{ background: SERIES[(slice.tone ?? index) % SERIES.length] }} />
             <span>{slice.label}</span>
             <strong>{slice.value.toLocaleString()}</strong>
@@ -279,21 +279,24 @@ export function ShareBar({ items, ariaLabel }: { items: { label: string; value: 
       </div>
     );
   }
+  // Bars and legend must share one filtered list: coloring them independently
+  // from different arrays desyncs the palette once zero-value items drop out.
+  const visible = items.filter((item) => item.value > 0);
   const color = (index: number, tone?: number) => `var(--pw-series-${((tone ?? index) % SERIES.length) + 1})`;
   return (
     <div className="share-bar" role="img" aria-label={ariaLabel}>
       <div className="share-track">
-        {items.filter((item) => item.value > 0).map((item, index) => (
+        {visible.map((item, index) => (
           <i
-            key={item.label}
+            key={`${item.label}-${index}`}
             style={{ width: `${(item.value / total) * 100}%`, background: color(index, item.tone) }}
             title={`${item.label}: ${item.value} (${((item.value / total) * 100).toFixed(0)}%)`}
           />
         ))}
       </div>
       <div className="share-legend">
-        {items.map((item, index) => (
-          <div className="share-legend-row" key={item.label}>
+        {visible.map((item, index) => (
+          <div className="share-legend-row" key={`${item.label}-${index}`}>
             <i style={{ background: color(index, item.tone) }} />
             <span>{item.label}</span>
             <strong>{item.value.toLocaleString()}</strong>

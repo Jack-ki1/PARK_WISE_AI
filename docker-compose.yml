@@ -1,12 +1,17 @@
 services:
   api:
     build:
-      context: ./backend
-      dockerfile: Dockerfile
+      # Repo root as context: the image also ships scripts/ (admin bootstrap).
+      context: .
+      dockerfile: backend/Dockerfile
     container_name: parkwise-api
     restart: unless-stopped
     environment:
       PARKWISE_ENV: ${PARKWISE_ENV:-development}
+      # The container must listen on 0.0.0.0 to accept published ports — and the
+      # startup safety check is told the truth, so auth-off here would (correctly)
+      # refuse to start. Auth therefore defaults to on for Docker deployments.
+      PARKWISE_API_HOST: 0.0.0.0
       PARKWISE_ALLOWED_ORIGINS: ${PARKWISE_ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
       PARKWISE_DATABASE_URL: ${PARKWISE_DATABASE_URL:-sqlite:////srv/data/parkwise.db}
       PARKWISE_DATA_DIR: /srv/data
@@ -19,7 +24,7 @@ services:
       PARKWISE_FRAME_STRIDE: ${PARKWISE_FRAME_STRIDE:-3}
       PARKWISE_DEVICE: ${PARKWISE_DEVICE:-auto}
       PARKWISE_AUTO_DOWNLOAD_PUBLIC_SOURCES: ${PARKWISE_AUTO_DOWNLOAD_PUBLIC_SOURCES:-true}
-      PARKWISE_AUTH_REQUIRED: ${PARKWISE_AUTH_REQUIRED:-false}
+      PARKWISE_AUTH_REQUIRED: ${PARKWISE_AUTH_REQUIRED:-true}
       PARKWISE_RATE_LIMIT_PER_MINUTE: ${PARKWISE_RATE_LIMIT_PER_MINUTE:-240}
       PARKWISE_STREAM_WIDTH: ${PARKWISE_STREAM_WIDTH:-960}
       PARKWISE_STREAM_QUALITY: ${PARKWISE_STREAM_QUALITY:-72}
@@ -41,6 +46,10 @@ services:
     build:
       context: ./web
       dockerfile: Dockerfile
+      args:
+        # Inlined into the browser bundle at build time — a runtime-only value
+        # would be ignored and the dashboard would keep talking to the default.
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
     container_name: parkwise-web
     restart: unless-stopped
     environment:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import Integer, func
 from sqlalchemy.orm import Session
 
@@ -14,6 +14,11 @@ from ..security import current_user
 from ..services import activity, billing
 
 router = APIRouter(prefix="/api", dependencies=[Depends(current_user)])
+
+# Completed jobs are grouped *with* their samples, which used to serialize every
+# video on every dashboard poll; the newest N cover the tables and the true total
+# is reported separately so the UI can say "showing 200 of 513".
+REVIEWED_VIDEOS_CAP = 200
 
 
 @router.get("/dashboard/analytics")
@@ -66,6 +71,9 @@ def dashboard_analytics(db: Session = Depends(get_db)) -> dict:
     observed = occupied_samples + free_samples
     utilisation_percent = round(occupied_samples / observed * 100, 1) if observed else None
 
+    reviewed_total = (
+        db.query(func.count(VideoJob.id)).filter(VideoJob.status == "completed").scalar() or 0
+    )
     per_video = (
         db.query(
             VideoJob.id,
@@ -81,6 +89,8 @@ def dashboard_analytics(db: Session = Depends(get_db)) -> dict:
         .outerjoin(OccupancySample, OccupancySample.video_id == VideoJob.id)
         .filter(VideoJob.status == "completed")
         .group_by(VideoJob.id)
+        .order_by(VideoJob.completed_at.desc())
+        .limit(REVIEWED_VIDEOS_CAP)
         .all()
     )
     trend_by_day: dict[str, list[float]] = {}
@@ -175,9 +185,10 @@ def dashboard_analytics(db: Session = Depends(get_db)) -> dict:
         "reviewed_videos": sorted(
             reviewed, key=lambda item: item["completed_at"] or "", reverse=True
         ),
+        "reviewed_videos_total": int(reviewed_total),
     }
 
 
 @router.get("/activity")
-def activity_feed(limit: int = 50, db: Session = Depends(get_db)) -> dict:
+def activity_feed(limit: int = Query(default=50, ge=1, le=200), db: Session = Depends(get_db)) -> dict:
     return {"items": activity.recent(db, limit)}
