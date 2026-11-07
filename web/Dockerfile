@@ -1,9 +1,9 @@
-FROM node:22-alpine AS deps
+FROM node:25-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 
-FROM node:22-alpine AS builder
+FROM node:25-alpine AS builder
 WORKDIR /app
 # NEXT_PUBLIC_* is inlined into the browser bundle at build time — it must be an
 # ARG here (and a build arg in docker-compose.yml), not only a runtime environment
@@ -15,7 +15,7 @@ COPY . .
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 
-FROM node:22-alpine AS runner
+FROM node:25-alpine AS runner
 WORKDIR /app
 ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 HOSTNAME=0.0.0.0 PORT=3000
 COPY --from=builder --chown=node:node /app/public ./public
