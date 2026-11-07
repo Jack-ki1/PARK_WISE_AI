@@ -36,7 +36,7 @@ Parking operators often have incomplete or delayed visibility into real capacity
 
 ### The solution
 
-ParkSight converts supported camera feeds and optional sensors into a current parking-space inventory and an auditable history of how the facility is used. Operators can view a facility in real time, understand data freshness, receive actionable alerts, analyze patterns, and share availability through signs or approved APIs.
+ParkWise converts supported camera feeds and optional sensors into a current parking-space inventory and an auditable history of how the facility is used. Operators can view a facility in real time, understand data freshness, receive actionable alerts, analyze patterns, and share availability through signs or approved APIs.
 
 ### Primary customer segments
 

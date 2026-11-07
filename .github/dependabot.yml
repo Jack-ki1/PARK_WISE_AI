@@ -1,0 +1,39 @@
+# Automated dependency updates (Change Set 0, C0.8).
+version: 2
+updates:
+  # Python backend: requirements files under backend/.
+  - package-ecosystem: pip
+    directory: /backend
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+
+  # Next.js dashboard: package-lock.json under web/.
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+
+  # GitHub Actions workflows (pinned to commit SHAs — review tag in comment).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+
+  # Container images (backend/Dockerfile and web/Dockerfile).
+  - package-ecosystem: docker
+    directory: /backend
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+
+  - package-ecosystem: docker
+    directory: /web
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3

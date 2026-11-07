@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from ..config import settings as env_settings
 from ..models import Stream, VideoJob
-from . import settings_store, storage
+from . import settings_store
 
 
 def _month_start() -> datetime:
@@ -20,10 +20,8 @@ def _month_start() -> datetime:
     return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
 
-def storage_bytes(db: Session) -> int:
-    """Bytes this deployment holds: object storage sums its ledger, local walks the tree."""
-    if storage.is_blob():
-        return storage.assets_bytes(db)
+def storage_bytes() -> int:
+    """Bytes this deployment holds: walk the local media tree (single code path)."""
     root = Path(env_settings.data_dir).expanduser().resolve()
     total = 0
     for folder in ("uploads", "processed", "previews", "streams"):
@@ -62,7 +60,7 @@ def usage(db: Session) -> dict:
     return {
         "videos_this_month": int(videos_month),
         "analysis_minutes_this_month": round(float(duration_seconds) / 60.0, 1),
-        "storage_bytes": storage_bytes(db),
+        "storage_bytes": storage_bytes(),
         "concurrent_jobs": int(concurrent),
         "streams": int(streams),
     }

@@ -281,3 +281,26 @@ class TestStreamLifecycle:
             assert manager.get(stream_id) is active
         finally:
             manager.stop(stream_id, timeout=2.0)
+
+
+class TestUploadErrorPath:
+    def test_non_valueerror_from_job_creation_returns_422(self, client, monkeypatch):
+        """C0.2: the generic upload handler must not reference an undefined name.
+
+        A corrupt/unsupported file that fails *inside* _make_job with anything
+        other than ValueError used to hit `logger.exception(..., job_id)` where
+        `job_id` does not exist in upload_video (the local is `file_id`), turning
+        the intended 422 into a NameError -> 500.
+        """
+        import app.api.routes as routes_module
+
+        def _explode(*_args, **_kwargs):
+            raise OSError("disk read failed")
+
+        monkeypatch.setattr(routes_module, "_make_job", _explode)
+        response = client.post(
+            "/api/videos/upload",
+            files={"file": ("broken.mp4", b"not really a video", "video/mp4")},
+        )
+        assert response.status_code == 422
+        assert "Could not read this video" in response.json()["detail"]

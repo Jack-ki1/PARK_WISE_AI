@@ -18,7 +18,7 @@ from ..config import settings as env_settings
 from ..database import SessionLocal, get_db
 from ..models import Stream, VideoJob
 from ..schemas import StreamCreate, StreamPatch, StreamSpacesSave
-from ..security import actor_name, current_user, rate_limit, redact_url, require_roles, validate_external_url
+from ..security import actor_name, current_user, media_access, rate_limit, redact_url, require_roles, sign_media, validate_external_url
 from ..services import activity, billing, settings_store
 from ..services.live_stream import load_spaces, manager, save_snapshot, snapshot_for
 from . import ws_tickets
@@ -26,6 +26,9 @@ from . import ws_tickets
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", dependencies=[Depends(current_user)])
+# Snapshot JPEGs are loaded by <img> tags that cannot send an X-API-Key header;
+# they authenticate via a signed URL (or a normal API key) instead.
+media_router = APIRouter(prefix="/api", dependencies=[Depends(media_access)])
 # The frame WebSocket authenticates via a short-lived single-use ticket (?ticket=)
 # when auth is required (browsers cannot send headers on a WebSocket handshake),
 # so it lives on a router without header auth.
@@ -66,7 +69,7 @@ def _stream_out(db: Session, stream: Stream) -> dict:
         "lon": stream.lon,
         "spaces": spaces,
         "space_count": len(spaces),
-        "snapshot_url": f"/api/streams/{stream.id}/snapshot" if stream.snapshot_path else None,
+        "snapshot_url": sign_media(f"/api/streams/{stream.id}/snapshot", "stream.snapshot", stream.id) if stream.snapshot_path else None,
         "created_at": stream.created_at.isoformat() if stream.created_at else None,
     }
 
@@ -194,7 +197,7 @@ def capture_snapshot(stream_id: str, user=Depends(current_user), db: Session = D
     path = save_snapshot(stream_id, jpeg)
     stream.snapshot_path = path
     db.commit()
-    return {"snapshot_url": f"/api/streams/{stream_id}/snapshot"}
+    return {"snapshot_url": sign_media(f"/api/streams/{stream_id}/snapshot", "stream.snapshot", stream_id)}
 
 
 @router.post("/streams/{stream_id}/ws-ticket", dependencies=[Depends(rate_limit)])
@@ -222,7 +225,7 @@ def create_websocket_ticket(
     }
 
 
-@router.get("/streams/{stream_id}/snapshot")
+@media_router.get("/streams/{stream_id}/snapshot")
 def get_snapshot(stream_id: str, db: Session = Depends(get_db)) -> FileResponse:
     stream = _load_stream(db, stream_id)
     if not stream.snapshot_path:
@@ -280,7 +283,6 @@ async def stream_frames(websocket: WebSocket, stream_id: str) -> None:
                 code=4401,
                 reason="Authentication required: request a ticket via POST /api/streams/{id}/ws-ticket",
             )
-            return
             return
 
     db = SessionLocal()

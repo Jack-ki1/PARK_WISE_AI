@@ -37,14 +37,12 @@ class VideoJob(Base):
     preview_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     model_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    small_object: Mapped[bool] = mapped_column(Boolean, default=False)
     # Execution lease (see services/job_claim.py): exactly one worker may hold a job,
     # and a worker that dies mid-run is detectable instead of blocking the plan forever.
     lease_owner: Mapped[str | None] = mapped_column(String(120), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)
-    # Resumable execution: frame cursor plus ordered storage keys of written output segments.
-    chunk_cursor_frame: Mapped[int] = mapped_column(Integer, default=0)
-    segment_keys_json: Mapped[str] = mapped_column(Text, default="[]")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -113,6 +111,7 @@ class Stream(Base):
     lat: Mapped[float | None] = mapped_column(Float, nullable=True)
     lon: Mapped[float | None] = mapped_column(Float, nullable=True)
     target_fps: Mapped[int] = mapped_column(Integer, default=4)
+    small_object: Mapped[bool] = mapped_column(Boolean, default=False)
     subscriber_count: Mapped[int] = mapped_column(Integer, default=0)
     frames_delivered: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
@@ -144,26 +143,6 @@ class User(Base):
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
-class MediaAsset(Base):
-    """Size of every object held in blob storage (see services/storage.py).
-
-    Object storage has no directory to walk, so the storage quota has to be summed
-    from these rows. ``video_id`` is deliberately not a foreign key: an object can
-    be uploaded by the browser before its job row is registered (and must be
-    deletable after the job is gone).
-    """
-
-    __tablename__ = "media_assets"
-    __table_args__ = (Index("ix_media_assets_video", "video_id"),)
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    key: Mapped[str] = mapped_column(String(512), unique=True)
-    video_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    bytes: Mapped[int] = mapped_column(Integer, default=0)
-    content_type: Mapped[str | None] = mapped_column(String(120), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-
-
 class ActivityEvent(Base):
     """Audit/activity trail: what users have been doing (uploads, runs, edits, admin changes)."""
 
@@ -177,3 +156,27 @@ class ActivityEvent(Base):
     object_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class BayStateEvent(Base):
+    """Append-only bay state transitions with rule version, confidence, and model ID (C1.3)."""
+
+    __tablename__ = "bay_state_events"
+    __table_args__ = (
+        Index("ix_bay_state_events_space", "space_id", "created_at"),
+        Index("ix_bay_state_events_video", "video_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    video_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    stream_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    space_id: Mapped[str] = mapped_column(String(80), index=True)
+    from_state: Mapped[str] = mapped_column(String(16))
+    to_state: Mapped[str] = mapped_column(String(16))
+    rule_version: Mapped[str] = mapped_column(String(32), default="bay-state-v2")
+    model_version: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    confidence_band: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    timestamp_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+

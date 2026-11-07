@@ -1,20 +1,24 @@
 # Build and verification status
 
-Last verified: **2026-10-25** (session 7 — dashboard activity plots, Live Analysis mode split,
-Settings cleanup; backend unchanged since session 5). Environment: internet-connected Linux dev
+Last verified: **2026-11-02** (Change Set 0, the post-audit "stop the bleeding" pass — signed
+media URLs, dead blob/Vercel layer removed, per-model batch inference slot, self-hosted fonts,
+docs cleanup, ruff + pip-audit + npm audit wired into CI). Environment: internet-connected Linux dev
 machine, Python 3.12 venv (`.venv`), Node 24, Next.js 16.4.2 (Turbopack).
 
 ## Verified on this machine
 
-- **Backend tests: 107 passed** (`.venv/bin/python3 -m pytest backend/tests -q`) — the security
+- **Backend tests:** `.venv/bin/python3 -m pytest backend/tests -q` — the suite passes (counts are
+  deliberately not quoted here; CI runs the same command and is the authority). Coverage includes
+  the security
   suite (auth/roles, secret redaction, SSRF with trusted-CIDR allowlist and percent-encoded-credential
-  rejection, `redact_url`, WebSocket tickets incl. wrong-stream and single-use), stream
+  rejection, `redact_url`, WebSocket tickets incl. wrong-stream and single-use), signed media URLs,
+  batch model-slot concurrency, stream
   isolation/reconnect/staleness/tracker tests, insights metric tests, startup fail-closed security
-  tests, plus the new `backend/tests/test_regressions.py` (role gates, delete cleanup, video
+  tests, plus `backend/tests/test_regressions.py` (role gates, delete cleanup, video
   ws-ticket single-use/scoping/expiry, dashboard occupancy maths, billing PUT shape, stream
   lifecycle). A `conftest.py` autouse fixture drops/recreates tables, shuts down the stream manager
   and clears rate-limit/ticket state between tests.
-- **Repository check:** `python3 scripts/check_project.py` — 22 application files parsed, core files
+- **Repository check:** `python3 scripts/check_project.py` — application files parse, core files
   present.
 - **Syntax:** `python3 -m compileall -q backend/app` — clean.
 - **Frontend:** `npm run lint` — 0 errors (3 `next/no-img-element` warnings remain by design: preview
@@ -22,8 +26,9 @@ machine, Python 3.12 venv (`.venv`), Node 24, Next.js 16.4.2 (Turbopack).
   per-deployment `remotePatterns`). `npx tsc --noEmit` — clean. `npm run build` — OK.
   Design system (session 6): light-default bright palette with opt-in navy dark theme
   (`data-theme="dark"`), indigo→violet→cyan brand gradient, correct status semantics
-  (occupied/over red, free green), Plus Jakarta Sans + JetBrains Mono via `next/font/google`
-  (Geist uninstalled), component rules layered under Tailwind v4 (`@layer components`) with KPI,
+  (occupied/over red, free green), Plus Jakarta Sans + JetBrains Mono self-hosted via
+  `next/font/local` (woff2 subsets committed under `web/app/fonts/`; no build-time fetch from
+  Google Fonts), component rules layered under Tailwind v4 (`@layer components`) with KPI,
   button, hero and chart overrides above. Served dev CSS verified to contain the Tailwind
   theme/base/utilities layers + preflight alongside the design tokens, zero legacy font references;
   the dev server had to be restarted once because a process started before `postcss.config.mjs`
@@ -39,8 +44,8 @@ machine, Python 3.12 venv (`.venv`), Node 24, Next.js 16.4.2 (Turbopack).
   `MediaRecorder` webm capture; **Settings lost the Reports tab entirely** and gained model
   runtime presets with unsaved-change markers, webhook/source status chips, user search with a
   Last seen column, billing usage facts with ≥80% meter warnings and extra system rows. New CSS
-  lives inside `@layer components`. Verified: tsc clean, lint 0 errors, build OK, 107 backend
-  tests pass, served dev CSS contains all 15 new style groups with zero parse warnings.
+  lives inside `@layer components`. Verified: tsc clean, lint 0 errors, build OK, the backend
+  suite passes, served dev CSS contains all 15 new style groups with zero parse warnings.
 - **Production safety:** with `PARKWISE_ENV=production`, startup aborts (`RuntimeError`) if
   `PARKWISE_AUTH_REQUIRED=false` or `PARKWISE_ALLOWED_ORIGINS` contains a wildcard; a warning is
   logged if auth is off and the API binds a non-loopback interface.
@@ -125,8 +130,8 @@ machine, Python 3.12 venv (`.venv`), Node 24, Next.js 16.4.2 (Turbopack).
 
 ## Known open work (tracked, not hidden)
 
-- Frontend App Router modularization: `web/app/page.tsx` is still a single ~1,780-line page
-  (Phase 2).
+- Frontend App Router modularization: `web/app/dashboard/page.tsx` is still a single client
+  component hosting every dashboard view (Phase 2).
 - A role-based semantic CSS token redesign (beyond the current `--pw-cN` variable naming) is
   Phase 2; session 6 rebuilt the palette, typography and chart theming on top of those variables.
 

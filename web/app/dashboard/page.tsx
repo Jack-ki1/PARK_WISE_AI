@@ -701,7 +701,10 @@ export default function HomePage() {
     setMessage({ tone: "info", text: "Capturing a calibration frame from the source…" });
     try {
       const result = await api<{ snapshot_url: string }>(`/api/streams/${stream.id}/snapshot`, { method: "POST" });
-      setSnapshot({ id: stream.id, url: `${API}${result.snapshot_url}?t=${Date.now()}` });
+      // snapshot_url may already carry signed (?sig=&exp=) query params — bust the
+      // browser cache with a second param, never a second "?".
+      const bust = result.snapshot_url.includes("?") ? "&" : "?";
+      setSnapshot({ id: stream.id, url: `${API}${result.snapshot_url}${bust}t=${Date.now()}` });
       setMessage(null);
     } catch (err) { setMessage({ tone: "error", text: err instanceof Error ? err.message : "Could not capture a frame" }); }
   };

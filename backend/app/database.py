@@ -59,15 +59,21 @@ def get_db():
 # table, so databases created before those fields shipped would fail on the first
 # read of the job row. Adding them here keeps the "no migration tool" story honest
 # for a self-hosted pilot; Alembic is the upgrade path once schema changes matter.
+#
+# Timestamps use TIMESTAMP (not DATETIME): DATETIME is not a PostgreSQL type, so
+# the previous spelling broke the upgrade path on the database the README tells
+# you to deploy on. SQLite accepts TIMESTAMP as well.
 _ADDITIVE_COLUMNS = {
     "video_jobs": {
         "lease_owner": "VARCHAR(120)",
-        "lease_expires_at": "DATETIME",
+        "lease_expires_at": "TIMESTAMP",
         "attempt_count": "INTEGER DEFAULT 0",
-        "chunk_cursor_frame": "INTEGER DEFAULT 0",
-        "segment_keys_json": "TEXT DEFAULT '[]'",
         "confidence_total": "FLOAT DEFAULT 0",
         "confidence_sample_count": "INTEGER DEFAULT 0",
+        "small_object": "BOOLEAN DEFAULT FALSE",
+    },
+    "streams": {
+        "small_object": "BOOLEAN DEFAULT FALSE",
     },
 }
 

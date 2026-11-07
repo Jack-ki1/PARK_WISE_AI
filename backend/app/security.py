@@ -13,8 +13,10 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import ipaddress
 import re
+import secrets
 import socket
 import threading
 import time
@@ -23,7 +25,7 @@ from datetime import datetime, timezone
 from typing import Iterable
 from urllib.parse import parse_qsl, urlparse, urlunparse
 
-from fastapi import Depends, Header, HTTPException, Request
+from fastapi import Depends, Header, HTTPException, Query, Request
 from sqlalchemy.orm import Session
 
 from .config import settings as env_settings
@@ -426,3 +428,87 @@ def rate_limit(
     if limit <= 0:
         return
     rate_limiter.check(client_identity(request, authorization, x_api_key), limit)
+
+
+# ---------------------------------------------------------------------------
+# Signed media URLs (preview / original / annotated / snapshot).
+#
+# Browsers load <img>, <video> and file downloads without custom headers, so
+# the media endpoints cannot rely on X-API-Key the way JSON APIs do. Every media
+# URL handed out by the API therefore carries a short-lived HMAC signature bound
+# to (purpose, object id, expiry): a preview signature cannot fetch the original
+# video, and nothing signed here authenticates any non-media endpoint.
+#
+# Unlike the single-use WebSocket tickets, signatures are multi-use until `exp`
+# because one page may re-read the same image several times. The secret is
+# PARKWISE_MEDIA_SIGNING_SECRET when set (stable across restarts and replicas);
+# otherwise a random per-process secret is generated, which simply invalidates
+# outstanding URLs on restart — acceptable inside the single-process runtime.
+# ---------------------------------------------------------------------------
+
+_media_secret_lock = threading.Lock()
+_process_media_secret: str | None = None
+
+
+def media_secret() -> str:
+    configured = env_settings.media_signing_secret.strip()
+    if configured:
+        return configured
+    global _process_media_secret
+    with _media_secret_lock:
+        if _process_media_secret is None:
+            _process_media_secret = secrets.token_urlsafe(32)
+        return _process_media_secret
+
+
+def _media_signature(purpose: str, object_id: str, exp: int) -> str:
+    message = f"{purpose}|{object_id}|{exp}".encode("utf-8")
+    return hmac.new(media_secret().encode("utf-8"), message, hashlib.sha256).hexdigest()
+
+
+def sign_media(path: str, purpose: str, object_id: str, *, expires_at: int | None = None) -> str:
+    """Append ``sig``/``exp`` query params to a media path (used in API responses)."""
+    exp = expires_at if expires_at is not None else int(time.time()) + env_settings.media_url_ttl_seconds
+    sep = "&" if "?" in path else "?"
+    return f"{path}{sep}sig={_media_signature(purpose, object_id, exp)}&exp={exp}"
+
+
+def verify_media_signature(purpose: str, object_id: str, sig: str | None, exp: int | None) -> bool:
+    if not sig or exp is None:
+        return False
+    if exp < int(time.time()):
+        return False
+    return hmac.compare_digest(_media_signature(purpose, object_id, exp), sig)
+
+
+def media_scope(request: Request) -> tuple[str, str]:
+    """Derive (purpose, object id) from the routed media path being requested."""
+    params = request.path_params
+    if "video_id" in params:
+        kind, object_id = "video", str(params["video_id"])
+    elif "stream_id" in params:
+        kind, object_id = "stream", str(params["stream_id"])
+    else:  # pragma: no cover - only reachable if a route forgets its path param
+        kind, object_id = "", ""
+    action = request.url.path.rstrip("/").rsplit("/", 1)[-1]
+    return f"{kind}.{action}", object_id
+
+
+def media_access(
+    request: Request,
+    db: Session = Depends(get_db),
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    sig: str | None = Query(default=None),
+    exp: int | None = Query(default=None),
+) -> User | None:
+    """Authenticate a media request: a valid signed URL, else the normal API-key rules.
+
+    Attached (router-level) to the media-only routers so JSON endpoints never
+    accept signatures, and so a signature for one object/purpose never grants
+    access to another.
+    """
+    purpose, object_id = media_scope(request)
+    if verify_media_signature(purpose, object_id, sig, exp):
+        return None
+    return current_user(db=db, authorization=authorization, x_api_key=x_api_key)

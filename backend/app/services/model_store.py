@@ -8,6 +8,9 @@
 - `INFERENCE_LOCK` serializes inference calls: Ultralytics predictors are not
   safe for concurrent use on one instance, and serializing keeps CPU/GPU
   saturated by one worker instead of thrashing.
+- `batch_slot` additionally caps *batch* concurrency to one job per shared model
+  instance: a per-call lock only prevents overlapping predict() calls, not two
+  jobs interleaving their ByteTrack state across successive calls.
 """
 
 from __future__ import annotations
@@ -27,6 +30,9 @@ _BUILDING: dict[str, threading.Lock] = {}
 
 # Serializes every model.track/model.predict call (batch and live).
 INFERENCE_LOCK = threading.Lock()
+
+# One batch job at a time per shared model instance (key = "weights|device").
+_BATCH_SLOTS: dict[str, threading.Lock] = {}
 
 # Bounded per-stream instance cache (each instance holds its own tracker state).
 MAX_STREAM_MODELS = 6
@@ -82,6 +88,26 @@ def get_model(name: str, device: str = "auto"):
     tests and the API can start without the CV stack installed."""
     key = f"{name}|{device}"
     return _get_or_build(_MODEL_CACHE, key, lambda: _load_model(name, device))
+
+
+def batch_slot(name: str, device: str) -> threading.Lock:
+    """Per-model-instance lock held for the whole of one batch job.
+
+    The shared `get_model` cache means two concurrent jobs get the *same*
+    predictor; without this slot their ByteTrack state interleaves across
+    frames (S7). The caller heartbeats its job lease while waiting so a busy
+    model cannot let reap_stale() fail a job that is merely queued for its turn.
+    """
+    key = f"{name}|{device}"
+    with _LOCK:
+        return _BATCH_SLOTS.setdefault(key, threading.Lock())
+
+
+def reset_trackers(model) -> None:
+    """Drop ByteTrack state left behind by the previous job on a shared instance."""
+    predictor = getattr(model, "predictor", None)
+    if predictor is not None and hasattr(predictor, "trackers"):
+        predictor.trackers = []
 
 
 def get_stream_model(name: str, device: str, stream_id: str):

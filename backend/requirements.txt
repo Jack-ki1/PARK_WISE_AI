@@ -1,14 +1,5 @@
 # Runtime dependencies. PyTorch/Ultralytics model dependencies make the image large.
 # Pinned to the exact versions verified by the test suite for reproducible builds —
 # bump deliberately, together with a full test run.
-fastapi==0.159.1
-starlette==1.9.0
-uvicorn[standard]==0.54.0
-sqlalchemy==2.1.6
-pydantic-settings==2.16.1
-python-multipart==0.0.32
-httpx==0.28.1
-opencv-python-headless==4.14.0.94
+-r requirements-base.txt
 ultralytics==8.4.183
-Pillow==13.0.0
-imageio-ffmpeg==0.6.0

@@ -14,18 +14,6 @@ class Settings(BaseSettings):
     allowed_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
     database_url: str = "sqlite:///./data/parkwise.db"
     data_dir: str = "./data"
-    # Media bytes: "local" keeps the historical data_dir layout, "blob" uses
-    # Vercel Blob (required on serverless, where the filesystem is ephemeral).
-    storage_backend: str = "local"
-    # Scratch space for OpenCV/ffmpeg when the real filesystem is read-only
-    # (Vercel functions expose a sized /tmp). Empty = system temp dir.
-    tmp_dir: str = ""
-    # Vercel Blob store origin that serves objects, e.g.
-    # "https://abc123.us1.blob.vercel-storage.com". Public stores only.
-    blob_public_url: str = ""
-    # "public" = objects are served by the store's CDN (redirects from the API);
-    # "private" = the API streams the bytes itself, keeping per-role access checks.
-    blob_access: str = "public"
     max_upload_mb: int = 250
     max_video_seconds: int = 1800
     model: str = "yolo26s.pt"
@@ -38,6 +26,11 @@ class Settings(BaseSettings):
     # Security / limits (0 disables a check; see docs/SECURITY.md)
     auth_required: bool = False
     rate_limit_per_minute: int = 240
+    # HMAC secret for signed media URLs (preview/original/annotated/snapshot).
+    # Empty = a random per-process secret (outstanding URLs die on restart).
+    # Set explicitly when running more than one API replica.
+    media_signing_secret: str = ""
+    media_url_ttl_seconds: int = 600
     # Comma-separated CIDR allowlist for private camera networks, e.g.
     # "192.168.1.0/24,10.0.0.0/8". Empty = all private ranges allowed (LAN CCTV default).
     trusted_camera_cidrs: str = ""
@@ -82,15 +75,8 @@ class Settings(BaseSettings):
     def ensure_dirs(self) -> Path:
         """Create (if needed) and return the runtime data root."""
         path = Path(self.data_dir).expanduser().resolve()
-        folders = ("streams",) if self.storage_backend.strip().lower() == "blob" else ("uploads", "processed", "previews", "streams")
-        for folder in folders:
-            try:
-                (path / folder).mkdir(parents=True, exist_ok=True)
-            except OSError:
-                # Blob mode keeps media off this filesystem and a serverless root is
-                # read-only; only live-view JPEG snapshots genuinely need a directory.
-                if folder != "streams":
-                    raise
+        for folder in ("uploads", "processed", "previews", "streams"):
+            (path / folder).mkdir(parents=True, exist_ok=True)
         return path
 
     @property
@@ -109,8 +95,6 @@ def validate_startup_config(settings: "Settings") -> list[str]:
       non-loopback interface would publish an unauthenticated admin API to the
       network — that combination is refused outright, not warned about.
     """
-    import os
-
     problems: list[str] = []
     if settings.env.strip().lower() == "production":
         if not settings.auth_required:
@@ -124,17 +108,6 @@ def validate_startup_config(settings: "Settings") -> list[str]:
             "binding a non-loopback interface without authentication exposes the admin API to the network. "
             "Either enable auth (PARKWISE_AUTH_REQUIRED=true) or bind loopback (PARKWISE_API_HOST=127.0.0.1)"
         )
-    if settings.storage_backend.strip().lower() == "blob":
-        if not (
-            os.environ.get("BLOB_READ_WRITE_TOKEN")
-            or os.environ.get("VERCEL_BLOB_READ_WRITE_TOKEN")
-            or os.environ.get("BLOB_STORE_ID")
-        ):
-            problems.append(
-                "PARKWISE_STORAGE=blob needs BLOB_READ_WRITE_TOKEN (or BLOB_STORE_ID with Vercel OIDC)"
-            )
-        if settings.blob_access.strip().lower() not in {"public", "private"}:
-            problems.append("PARKWISE_BLOB_ACCESS must be 'public' or 'private'")
     return problems
 
 

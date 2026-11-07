@@ -7,9 +7,11 @@ from .config import settings, validate_startup_config
 from .database import SessionLocal, init_db
 from .api.routes import router as videos_router
 from .api.routes import health_router as videos_health_router
+from .api.routes import media_router as videos_media_router
 from .api.routes import ws_router as videos_ws_router
 from .api.insights import router as insights_router
 from .api.live import router as live_router
+from .api.live import media_router as live_media_router
 from .api.live import ws_router as live_ws_router
 from .api.admin import router as admin_router
 from .security import AUTH_LIMIT_PER_MINUTE, auth_limiter, client_ip
@@ -100,9 +102,11 @@ app.add_middleware(
 )
 app.include_router(videos_router)
 app.include_router(videos_health_router)
+app.include_router(videos_media_router)
 app.include_router(videos_ws_router)
 app.include_router(insights_router)
 app.include_router(live_router)
+app.include_router(live_media_router)
 app.include_router(live_ws_router)
 app.include_router(admin_router)
 

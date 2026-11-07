@@ -15,6 +15,13 @@
   (`/api/ws/videos/{id}`) take a short-lived, single-use ticket minted over REST
   (`POST /api/streams/{id}/ws-ticket`, `POST /api/videos/{id}/ws-ticket`; 60 s TTL, one
   connection each, close code 4401 when invalid). Durable keys are never placed in a URL.
+- **Signed media URLs.** `<img>`/`<video>` tags cannot attach an API-key header, so preview,
+  original, annotated and calibration-snapshot responses carry a short-lived HMAC-SHA256
+  signature (`?sig=…&exp=…`, default 600 s via `PARKWISE_MEDIA_URL_TTL_SECONDS`). A signature is
+  bound to one object and one purpose (a preview signature never opens the original video), is
+  accepted only on the media routes, and never authenticates a JSON endpoint. Set
+  `PARKWISE_MEDIA_SIGNING_SECRET` in production; otherwise a random per-process secret is used and
+  outstanding URLs die on restart.
 - **Rate limiting** on mutating endpoints (`PARKWISE_RATE_LIMIT_PER_MINUTE`, `0` disables).
 - **SSRF protection for camera/webhook URLs.** Schemes are allowlisted (`rtsp`, `rtsps`, `http`,
   `https`, `tcp`), metadata-service hosts are blocked, every resolved address of a hostname is

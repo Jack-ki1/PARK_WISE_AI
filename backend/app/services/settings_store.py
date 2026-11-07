@@ -147,6 +147,11 @@ SETTING_SCHEMA: dict[str, dict[str, Any]] = {
     "frame_stride": {"type": "integer", "validate": _number(1, 30, int)},
     "device": {"type": "string", "choices": DEVICE_CHOICES, "validate": _choice(DEVICE_CHOICES)},
     "multiscale": {"type": "boolean", "validate": _flag},
+    "bay_enter_occupied_s": {"type": "number", "validate": _number(0.1, 60.0)},
+    "bay_enter_free_s": {"type": "number", "validate": _number(0.1, 120.0)},
+    "bay_min_coverage": {"type": "number", "validate": _number(0.05, 0.95)},
+    "quality_min_luminance": {"type": "number", "validate": _number(0.0, 255.0)},
+    "quality_min_sharpness": {"type": "number", "validate": _number(0.0, 1000.0)},
     # Billing — admin only: these keys define the quotas every user is held to.
     "plan": {
         "type": "string",
@@ -173,6 +178,11 @@ DEFAULTS: dict[str, Any] = {
     "frame_stride": env_settings.frame_stride,
     "device": env_settings.device,
     "multiscale": env_settings.multiscale,
+    "bay_enter_occupied_s": 1.0,
+    "bay_enter_free_s": 2.0,
+    "bay_min_coverage": 0.35,
+    "quality_min_luminance": 15.0,
+    "quality_min_sharpness": 30.0,
     "plan": "starter",
     "webhook_url": None,
     "webhook_secret": None,
@@ -241,6 +251,11 @@ def inference_config(db: Session) -> dict[str, Any]:
         "frame_stride": values["frame_stride"],
         "device": values["device"],
         "multiscale": values["multiscale"],
+        "bay_enter_occupied_s": values["bay_enter_occupied_s"],
+        "bay_enter_free_s": values["bay_enter_free_s"],
+        "bay_min_coverage": values["bay_min_coverage"],
+        "quality_min_luminance": values["quality_min_luminance"],
+        "quality_min_sharpness": values["quality_min_sharpness"],
     }
 
 

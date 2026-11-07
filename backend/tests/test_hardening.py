@@ -1,6 +1,6 @@
 """Hardening pass tests: quota arithmetic, per-key settings RBAC, job claiming.
 
-These guard the issues recorded in the deep review (qoder.txt) — the billing meter
+These guard the issues recorded in the 2026-10-26 deep review — the billing meter
 once reported seconds as minutes, and an operator could lift its own plan through
 the generic settings endpoint.
 """

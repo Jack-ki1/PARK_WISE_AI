@@ -1,4 +1,4 @@
-"""Activity/audit trail (idea.md: privileged changes are recorded; dashboard shows 'what users do')."""
+"""Activity/audit trail (docs/PRODUCT_SPEC.md: privileged changes are recorded; dashboard shows 'what users do')."""
 
 from __future__ import annotations
 

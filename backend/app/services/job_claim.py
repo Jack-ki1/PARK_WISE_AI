@@ -52,7 +52,6 @@ def enqueue(db: Session, video_id: str, *, terminal_statuses: tuple[str, ...] = 
                 "progress_percent": 0.0,
                 "current_frame": 0,
                 "processed_frames": 0,
-                "chunk_cursor_frame": 0,
                 "max_vehicle_count": None,
                 "avg_confidence": None,
                 "confidence_sample_count": 0,
@@ -81,7 +80,6 @@ def claim(
     from_statuses: tuple[str, ...] = ("queued",),
     lease_seconds: int = LEASE_SECONDS,
     owner: str | None = None,
-    reset_cursor: bool = True,
 ) -> bool:
     """Move a job into ``processing`` iff it is currently in ``from_statuses``.
 
@@ -97,8 +95,6 @@ def claim(
         "error_message": None,
         "started_at": now,
     }
-    if reset_cursor:
-        values["chunk_cursor_frame"] = 0
     statement = (
         db.query(VideoJob)
         .filter(VideoJob.id == video_id, VideoJob.status.in_(list(from_statuses)))

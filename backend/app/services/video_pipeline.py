@@ -25,12 +25,13 @@ import numpy as np
 
 from ..config import settings
 from ..database import SessionLocal
-from ..models import DetectionSample, OccupancySample, ParkingSpace, VideoJob
+from ..models import BayStateEvent, DetectionSample, OccupancySample, ParkingSpace, VideoJob
 from ..security import sanitize_error_message
 from . import integrations as integrations_service
 from . import job_claim, settings_store
 from .activity import record as record_activity
-from .model_store import get_model
+from .bay_state import BayStateMachine, BayTuning, QualityGate, polygon_box_overlap
+from .model_store import INFERENCE_LOCK, batch_slot, get_model, reset_trackers
 
 logger = logging.getLogger(__name__)
 VEHICLE_COCO_CLASSES = [2, 3, 5, 7]  # car, motorcycle, bus, truck in COCO
@@ -111,11 +112,16 @@ def _model_kwargs(imgsz: int, cfg: dict) -> dict:
 
 
 def _detect_pass(model, frame: np.ndarray, imgsz: int, *, track: bool, cfg: dict) -> list[dict]:
-    """One vehicle-only detection pass. Only the primary pass runs ByteTrack."""
-    if track:
-        result = model.track(frame, persist=True, tracker="bytetrack.yaml", **_model_kwargs(imgsz, cfg))[0]
-    else:
-        result = model.predict(frame, **_model_kwargs(imgsz, cfg))[0]
+    """One vehicle-only detection pass. Only the primary pass runs ByteTrack.
+
+    Runs inside INFERENCE_LOCK: live sessions share the process-wide inference
+    lock, and an unguarded batch pass would race them on the same CPU/GPU.
+    """
+    with INFERENCE_LOCK:
+        if track:
+            result = model.track(frame, persist=True, tracker="bytetrack.yaml", **_model_kwargs(imgsz, cfg))[0]
+        else:
+            result = model.predict(frame, **_model_kwargs(imgsz, cfg))[0]
     return _vehicle_boxes(result)
 
 
@@ -199,6 +205,8 @@ def process_video_job(video_id: str) -> None:
     db = SessionLocal()
     cap = None
     writer = None
+    slot = None
+    slot_held = False
     owner = f"pid-{os.getpid()}:{uuid.uuid4().hex[:8]}"
     try:
         job = db.get(VideoJob, video_id)
@@ -228,6 +236,17 @@ def process_video_job(video_id: str) -> None:
         # Model weights load lazily (and are shared with live view sessions) so app
         # startup and API docs stay available without the heavyweight CV runtime.
         model = get_model(cfg["model"], cfg["device"])
+        # C0.6: one batch job at a time per shared model instance. The predictor
+        # carries ByteTrack state across frames, so two jobs on one instance would
+        # interleave track ids. Waiting happens *after* the claim, so the lease is
+        # heartbeated here — otherwise a busy model could let reap_stale() fail a
+        # job that is merely queued for its turn.
+        slot = batch_slot(cfg["model"], cfg["device"])
+        while not slot.acquire(timeout=30.0):
+            if not job_claim.heartbeat(db, video_id, owner):
+                raise RuntimeError("Lost the analysis lease while waiting for the model slot.")
+        slot_held = True
+        reset_trackers(model)
         cap = cv2.VideoCapture(str(source_path))
         if not cap.isOpened():
             raise ValueError("OpenCV could not open this video. Re-encode to H.264 MP4 and retry.")
@@ -346,7 +365,6 @@ def process_video_job(video_id: str) -> None:
                 if job:
                     job.current_frame = frame_index
                     job.processed_frames = processed_index
-                    job.chunk_cursor_frame = frame_index + 1
                     job.progress_percent = min(99.0, (frame_index + 1) * 100 / total_frames) if total_frames else 0.0
                     job.max_vehicle_count = max_vehicles
                     job.confidence_total = confidence_total
@@ -434,6 +452,8 @@ def process_video_job(video_id: str) -> None:
         except Exception:
             logger.exception("Could not persist failure for video %s", video_id)
     finally:
+        if slot_held and slot is not None:
+            slot.release()
         if cap is not None:
             cap.release()
         if writer is not None:

@@ -36,6 +36,7 @@ GET /api/videos/{video_id}/spaces
 GET /api/streams
 GET /api/streams/{stream_id}
 GET /api/streams/{stream_id}/events
+GET /api/streams/{stream_id}/snapshot
 ```
 
 `GET /api/videos/{video_id}/occupancy` returns the stored per-bay history of the last analysis run
@@ -98,6 +99,12 @@ POST /api/videos/{video_id}/ws-ticket
 WS   /api/ws/videos/{video_id}          # 1 Hz job progress
 ```
 
+Media URLs are returned already signed (`…?sig=…&exp=…`): browsers load them from
+`<img>`/`<video>` tags that cannot send an `X-API-Key` header. A signature is an
+HMAC bound to one object and one purpose (a preview signature never opens the
+original video), valid until `exp` (default 600 s), and authenticates only these
+media routes — never the JSON API. A normal API key header still works everywhere.
+
 Streams (RTSP/HTTP camera URL or replay of an uploaded video):
 
 ```bash
@@ -113,6 +120,7 @@ PATCH  /api/streams/{stream_id}
 DELETE /api/streams/{stream_id}          # also deletes its calibration snapshot file
 PUT    /api/streams/{stream_id}/spaces   # replace bay polygons
 POST   /api/streams/{stream_id}/snapshot  # capture a calibration frame
+GET    /api/streams/{stream_id}/snapshot  # signed calibration JPEG
 POST   /api/streams/{stream_id}/start
 POST   /api/streams/{stream_id}/stop
 POST   /api/streams/{stream_id}/ws-ticket
@@ -122,7 +130,7 @@ WS     /api/ws/streams/{stream_id}       # annotated frames + status messages
 Stream responses redact any URL userinfo (`url` is already display-safe), and report `source_mode`
 (`live_camera`/`replay`), `running`, `stale`, `last_frame_age_seconds`, `frames_delivered` and
 `subscriber_count`. Streams are billed against the active plan (video/stream/storage quotas);
-`POST /api/billing` selects a plan and answers `402` when a limit is exceeded, `422` when the
+`PUT /api/billing` selects a plan and answers `402` when a limit is exceeded, `422` when the
 request is invalid.
 
 ## Administration

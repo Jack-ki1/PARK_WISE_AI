@@ -20,7 +20,7 @@ from ..config import settings
 from ..database import SessionLocal, get_db
 from ..models import DetectionSample, OccupancySample, ParkingSpace, Stream, VideoJob
 from ..schemas import DashboardSummary, DetectionPoint, OccupancyPoint, OccupancySeries, PublicSourceList, SourceOut, SpaceCreate, SpaceOut, VideoJobOut
-from ..security import actor_name, current_user, pin_validated_url, rate_limit, require_roles
+from ..security import actor_name, current_user, media_access, pin_validated_url, rate_limit, require_roles, sign_media
 from ..services import activity, billing, job_claim, settings_store
 from ..services.live_stream import manager
 from ..services.public_sources import PUBLIC_SOURCES, list_public_sources
@@ -32,6 +32,10 @@ router = APIRouter(prefix="/api", dependencies=[Depends(current_user)])
 # Liveness probe stays credential-free so container healthchecks and the
 # launcher's wait-loop work when auth is enabled; it exposes only status/time.
 health_router = APIRouter(prefix="/api")
+# Media bytes (preview/original/annotated) are fetched by <img>/<video>/downloads
+# that cannot send an X-API-Key header, so these routes authenticate through a
+# signed URL (or a normal API key) instead of the router-wide dependency.
+media_router = APIRouter(prefix="/api", dependencies=[Depends(media_access)])
 # The job-progress WebSocket authenticates through a short-lived ticket (see ws_tickets).
 ws_router = APIRouter(prefix="/api")
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
@@ -63,9 +67,9 @@ def _video_out(job: VideoJob, db: Session) -> VideoJobOut:
         model_name=job.model_name,
         created_at=job.created_at,
         completed_at=job.completed_at,
-        preview_url=f"/api/videos/{job.id}/preview" if job.preview_path and Path(job.preview_path).exists() else None,
-        original_url=f"/api/videos/{job.id}/original" if Path(job.file_path).exists() else None,
-        annotated_url=f"/api/videos/{job.id}/annotated" if job.processed_video_path and Path(job.processed_video_path).exists() else None,
+        preview_url=sign_media(f"/api/videos/{job.id}/preview", "video.preview", job.id) if job.preview_path and Path(job.preview_path).exists() else None,
+        original_url=sign_media(f"/api/videos/{job.id}/original", "video.original", job.id) if Path(job.file_path).exists() else None,
+        annotated_url=sign_media(f"/api/videos/{job.id}/annotated", "video.annotated", job.id) if job.processed_video_path and Path(job.processed_video_path).exists() else None,
         configured_spaces=db.query(ParkingSpace).filter(ParkingSpace.video_id == job.id).count(),
     )
 
@@ -225,7 +229,9 @@ async def upload_video(file: UploadFile = File(...), user=Depends(current_user),
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
         target.unlink(missing_ok=True)
-        logger.exception("Could not inspect uploaded video %s", job_id)
+        # file_id (not job_id): _make_job failed before a job row existed, and
+        # referencing an undefined name here would turn this 422 into a 500.
+        logger.exception("Could not inspect uploaded video %s", file_id)
         raise HTTPException(
             status_code=422,
             detail="Could not read this video. Check the codec/container and try re-encoded H.264 MP4.",
@@ -393,7 +399,7 @@ def process_video(video_id: str, background_tasks: BackgroundTasks, user=Depends
     return _video_out(job, db)
 
 
-@router.get("/videos/{video_id}/preview")
+@media_router.get("/videos/{video_id}/preview")
 def video_preview(video_id: str, db: Session = Depends(get_db)):
     job = _load_job(video_id, db)
     path = Path(job.preview_path) if job.preview_path else None
@@ -402,7 +408,7 @@ def video_preview(video_id: str, db: Session = Depends(get_db)):
     return FileResponse(path, media_type="image/jpeg", filename=f"{video_id}-preview.jpg")
 
 
-@router.get("/videos/{video_id}/original")
+@media_router.get("/videos/{video_id}/original")
 def video_original(video_id: str, db: Session = Depends(get_db)):
     job = _load_job(video_id, db)
     path = Path(job.file_path)
@@ -412,7 +418,7 @@ def video_original(video_id: str, db: Session = Depends(get_db)):
     return FileResponse(path, media_type=media_type, filename=job.original_name, content_disposition_type="inline")
 
 
-@router.get("/videos/{video_id}/annotated")
+@media_router.get("/videos/{video_id}/annotated")
 def video_annotated(video_id: str, db: Session = Depends(get_db)):
     job = _load_job(video_id, db)
     if not job.processed_video_path:
