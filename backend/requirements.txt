@@ -2,4 +2,4 @@
 # Pinned to the exact versions verified by the test suite for reproducible builds —
 # bump deliberately, together with a full test run.
 -r requirements-base.txt
-ultralytics==8.4.183
+ultralytics==8.4.202
