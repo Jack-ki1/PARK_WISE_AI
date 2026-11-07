@@ -14,28 +14,37 @@ from ..config import settings as env_settings
 from ..models import Stream, VideoJob
 from . import settings_store
 
+_STORAGE_CACHE: dict[str, float] = {"bytes": 0.0, "updated_at": 0.0}
+_STORAGE_CACHE_TTL: float = 60.0  # seconds
+
 
 def _month_start() -> datetime:
     now = datetime.now(timezone.utc)
     return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
 
-def storage_bytes() -> int:
-    """Bytes this deployment holds: walk the local media tree (single code path)."""
+def storage_bytes(force_refresh: bool = False) -> int:
+    """Bytes this deployment holds: cached with 60s TTL to prevent disk I/O thrashing."""
+    import time
+    now = time.monotonic()
+    if not force_refresh and (now - _STORAGE_CACHE["updated_at"]) < _STORAGE_CACHE_TTL:
+        return int(_STORAGE_CACHE["bytes"])
+
     root = Path(env_settings.data_dir).expanduser().resolve()
     total = 0
     for folder in ("uploads", "processed", "previews", "streams"):
         base = root / folder
         if not base.exists():
             continue
-        # Nested layout (<category>/<video-id>/<file>) and the historical flat one
-        # both have to count, so this walks directories rather than listing files.
         for path in base.rglob("*"):
             try:
                 if path.is_file():
                     total += os.stat(path).st_size
             except OSError:
                 continue
+
+    _STORAGE_CACHE["bytes"] = float(total)
+    _STORAGE_CACHE["updated_at"] = now
     return total
 
 

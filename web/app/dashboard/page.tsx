@@ -1,7 +1,8 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent, FormEvent, KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import type { LucideIcon } from "lucide-react";
 import {
   Activity, AlertTriangle, ArrowRight, Building2, CalendarDays, Check, ChevronDown, CircleHelp,
@@ -37,7 +38,7 @@ const settingsTabs: { id: SettingsTabId; label: string; icon: LucideIcon }[] = [
   { id: "model", label: "Model", icon: Cpu },
   { id: "integrations", label: "Integrations", icon: Webhook },
   { id: "users", label: "Users", icon: Users },
-  { id: "billing", label: "Billing", icon: CreditCard },
+  { id: "billing", label: "Usage & Limits", icon: CreditCard },
   { id: "system", label: "System", icon: ShieldCheck },
 ];
 
@@ -94,15 +95,30 @@ const MODEL_FAMILIES: { key: string; name: string; note: string }[] = [
   { key: "rtdetr", name: "RT-DETR", note: "Transformer detector for accuracy-first experiments. Benchmark on your own holdout clips before switching." },
 ];
 
-export default function HomePage() {
-  const [activePage, setActivePage] = useState<PageId>("dashboard");
-  const [settingsTab, setSettingsTab] = useState<SettingsTabId>("model");
-  const [analysisMode, setAnalysisMode] = useState<AnalysisMode>("live");
+function HomePageContent() {
+  const searchParams = useSearchParams();
+  const router = useRouter();
+
+  const initPage = searchParams.get("page") as PageId | null;
+  const initTab = searchParams.get("tab") as SettingsTabId | null;
+  const initMode = searchParams.get("mode") as AnalysisMode | null;
+  const initVideo = searchParams.get("video") || "";
+  const initStream = searchParams.get("stream") || "";
+
+  const [activePage, setActivePage] = useState<PageId>(
+    initPage === "dashboard" || initPage === "live" || initPage === "settings" ? initPage : "dashboard"
+  );
+  const [settingsTab, setSettingsTab] = useState<SettingsTabId>(
+    initTab && SETTINGS_TAB_IDS.includes(initTab) ? initTab : "model"
+  );
+  const [analysisMode, setAnalysisMode] = useState<AnalysisMode>(
+    initMode === "live" || initMode === "recorded" ? initMode : "live"
+  );
   const [summary, setSummary] = useState<Summary | null>(null);
   const [videos, setVideos] = useState<VideoJob[]>([]);
   const [sources, setSources] = useState<Source[]>([]);
   const [serverConfig, setServerConfig] = useState<PublicConfig | null>(null);
-  const [selectedId, setSelectedId] = useState("");
+  const [selectedId, setSelectedId] = useState(initVideo);
   const [spacesByVideo, setSpacesByVideo] = useState<Record<string, Space[]>>({});
   const [analyticsByVideo, setAnalyticsByVideo] = useState<Record<string, Point[]>>({});
   const [occupancyByVideo, setOccupancyByVideo] = useState<Record<string, OccupancyPoint[]>>({});
@@ -117,6 +133,17 @@ export default function HomePage() {
   const fileRef = useRef<HTMLInputElement>(null);
   const { theme, toggleTheme } = useTheme();
 
+  const handlePageChange = (page: PageId) => {
+    setActivePage(page);
+    try {
+      const params = new URLSearchParams(window.location.search);
+      params.set("page", page);
+      router.replace(`/dashboard?${params.toString()}`, { scroll: false });
+    } catch {
+      // Safe fallback
+    }
+  };
+
   // Dashboard aggregates
   const [dash, setDash] = useState<AnalyticsPayload | null>(null);
   const [activity, setActivity] = useState<ActivityItem[]>([]);
@@ -125,8 +152,8 @@ export default function HomePage() {
 
   // Live streams
   const [streams, setStreams] = useState<StreamRow[]>([]);
-  const [selectedStreamId, setSelectedStreamId] = useState("");
-  const [watchId, setWatchId] = useState("");
+  const [selectedStreamId, setSelectedStreamId] = useState(initStream);
+  const [watchId, setWatchId] = useState(initStream);
   // Bumped on every Watch click so re-watching the same stream restarts the
   // connect effect even though watchId itself is unchanged.
   const [watchSession, setWatchSession] = useState(0);
@@ -880,7 +907,7 @@ export default function HomePage() {
           {navItems.map((item, index) => (
             <div key={item.id}>
               {item.section && <div className={`nav-section ${index ? "spaced" : ""}`}>{item.section}</div>}
-              <button data-nav={item.id} className={`nav-item ${activePage === item.id ? "active" : ""}`} onClick={() => { setActivePage(item.id); setMobileNav(false); setMessage(null); }}>
+              <button data-nav={item.id} className={`nav-item ${activePage === item.id ? "active" : ""}`} onClick={() => { handlePageChange(item.id); setMobileNav(false); setMessage(null); }}>
                 <item.icon size={17} /><span>{item.label}</span>
                 {item.id === "dashboard" && failedVideos.length > 0 && <b className="nav-count">{failedVideos.length}</b>}
                 {activePage === item.id && <span className="nav-active-dot" />}
@@ -890,7 +917,7 @@ export default function HomePage() {
         </nav>
         <div className="sidebar-bottom">
           <div className="edge-status"><div className="edge-status-top"><span className={`status-dot ${apiStatus === "online" ? "online" : apiStatus === "offline" ? "offline" : ""}`} /><strong>API connection</strong><span className="edge-status-value">{apiStatus === "online" ? "Connected" : apiStatus === "offline" ? "Offline" : "Checking"}</span></div><div className="edge-status-desc">{apiStatus === "online" ? "Measurements persist to the configured database." : apiStatus === "offline" ? "Start the FastAPI service to load real records." : "Checking API health…"}</div></div>
-          <div className="profile-row"><div className="profile-avatar">PW</div><div className="profile-text"><strong>Operator</strong><span>Local administrator</span></div><button className="icon-btn" title="Settings" onClick={() => { setActivePage("settings"); setMobileNav(false); }}><SlidersHorizontal size={16} /></button></div>
+          <div className="profile-row"><div className="profile-avatar">PW</div><div className="profile-text"><strong>Operator</strong><span>Local administrator</span></div><button className="icon-btn" title="Settings" onClick={() => { handlePageChange("settings"); setMobileNav(false); }}><SlidersHorizontal size={16} /></button></div>
           <div className="side-footer">PARKWISE AI <span>v{APP_VERSION} · PILOT</span></div>
         </div>
       </aside>
@@ -1010,6 +1037,7 @@ export default function HomePage() {
                   ) : (
                     <>
                       <div className="review-detail-grid">
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
                         {reviewJob.preview_url && <img className="detail-preview" src={`${API}${reviewJob.preview_url}`} alt={`Preview frame from ${reviewJob.original_name}`} />}
                         <div className="detail-facts">
                           <Fact label="Peak vehicles" value={fmtNum(reviewJob.max_vehicle_count)} />
@@ -1155,6 +1183,7 @@ export default function HomePage() {
                     <div className="viewer-frame">
                       {hudFrame?.jpeg ? (
                         <>
+                          {/* eslint-disable-next-line @next/next/no-img-element */}
                           <img src={`data:image/jpeg;base64,${hudFrame.jpeg}`} alt={`Annotated frame from ${activeStream.name}`} />
                           {activeStream.spaces.length > 0 && (
                             <svg className="bay-overlay" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
@@ -1368,7 +1397,9 @@ export default function HomePage() {
                   action={<span className={`status-pill ${statusClass(selected.status)}`}><span className="status-dot" />{statusLabel(selected.status)}{selected.status === "processing" ? ` ${selected.progress_percent.toFixed(0)}%` : ""}</span>} />
                 <div className="selected-detail-grid">
                   {selected.preview_url ? (
-                    <div className="video-preview"><img src={`${API}${selected.preview_url}`} alt={`Preview frame from ${selected.original_name}`} /><span className="preview-watermark">{selected.source_type === "public" ? "PUBLIC RECORDED FOOTAGE" : "UPLOADED SOURCE"}</span></div>
+                    <div className="video-preview">
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img src={`${API}${selected.preview_url}`} alt={`Preview frame from ${selected.original_name}`} /><span className="preview-watermark">{selected.source_type === "public" ? "PUBLIC RECORDED FOOTAGE" : "UPLOADED SOURCE"}</span></div>
                   ) : (
                     <div className="empty-visual"><div className="empty-visual-icon"><Video size={28} /></div><strong>No preview frame yet</strong><span>Preview appears after import inspects the file.</span></div>
                   )}
@@ -1906,5 +1937,19 @@ function ReviewedTable({ rows, openId, onOpen }: { rows: ReviewedVideo[]; openId
         ))}</tbody>
       </table>
     </div>
+  );
+}
+
+export default function HomePage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="flex min-h-screen items-center justify-center text-sm text-[var(--text-muted)]">
+          Loading ParkWise Operations...
+        </div>
+      }
+    >
+      <HomePageContent />
+    </Suspense>
   );
 }

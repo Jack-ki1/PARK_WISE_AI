@@ -9,10 +9,8 @@ Replaces centre-point-in-polygon & sample-count smoothing with:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import logging
-import math
-from typing import Any
 
 import numpy as np
 
@@ -111,7 +109,7 @@ def polygon_box_overlap(polygon_px: np.ndarray, box_px: list[int] | tuple[int, i
     box_area = float(box_w * box_h)
 
     poly_pts = polygon_px.reshape((-1, 1, 2)).astype(np.int32)
-    bay_area = float(cv2.polygonArea(poly_pts))
+    bay_area = float(cv2.contourArea(poly_pts))
     if bay_area <= 0:
         return 0.0, 0.0
 
@@ -123,7 +121,7 @@ def polygon_box_overlap(polygon_px: np.ndarray, box_px: list[int] | tuple[int, i
             poly_pts.astype(np.float32), box_poly.astype(np.float32)
         )
         if success and intersection is not None and len(intersection) >= 3:
-            inter_area = float(cv2.polygonArea(intersection))
+            inter_area = float(cv2.contourArea(intersection))
             return min(1.0, inter_area / bay_area), min(1.0, inter_area / box_area)
     except cv2.error:
         pass

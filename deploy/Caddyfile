@@ -1,0 +1,13 @@
+:80 {
+    encode gzip zstd
+
+    # Route WebSocket upgrades and API requests to FastAPI backend
+    handle /api/* {
+        reverse_proxy api:8000
+    }
+
+    # Route all other web UI requests to Next.js standalone server
+    handle {
+        reverse_proxy web:3000
+    }
+}

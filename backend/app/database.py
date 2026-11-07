@@ -21,16 +21,15 @@ if IS_SQLITE:
 if IS_SQLITE:
     engine = create_engine(settings.database_url, connect_args=connect_args, pool_pre_ping=True)
 else:
-    # Serverless/Postgres: every warm or cold function instance holds at most a couple
-    # of pooled connections, and pooled (PgBouncer) endpoints need short recycling.
+    # Production / long-lived service connection pool (Postgres)
     engine = create_engine(
         settings.database_url,
         connect_args=connect_args,
         pool_pre_ping=True,
-        pool_size=2,
-        max_overflow=3,
-        pool_recycle=60,
-        pool_timeout=15,
+        pool_size=settings.db_pool_size,
+        max_overflow=settings.db_max_overflow,
+        pool_recycle=settings.db_pool_recycle,
+        pool_timeout=settings.db_pool_timeout,
     )
 
 if IS_SQLITE:

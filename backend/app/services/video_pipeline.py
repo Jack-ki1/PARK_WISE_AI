@@ -25,12 +25,11 @@ import numpy as np
 
 from ..config import settings
 from ..database import SessionLocal
-from ..models import BayStateEvent, DetectionSample, OccupancySample, ParkingSpace, VideoJob
+from ..models import DetectionSample, OccupancySample, ParkingSpace, VideoJob
 from ..security import sanitize_error_message
 from . import integrations as integrations_service
 from . import job_claim, settings_store
 from .activity import record as record_activity
-from .bay_state import BayStateMachine, BayTuning, QualityGate, polygon_box_overlap
 from .model_store import INFERENCE_LOCK, batch_slot, get_model, reset_trackers
 
 logger = logging.getLogger(__name__)

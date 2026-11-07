@@ -1,4 +1,6 @@
 import logging
+import time
+import uuid
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -74,6 +76,33 @@ app = FastAPI(
 # Registered before CORS so CORS ends up outermost and every response (including a
 # 429 produced here) still carries the browser's required headers.
 @app.middleware("http")
+async def security_headers_middleware(request, call_next):
+    """Enforce strict browser security headers on all responses."""
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("Cross-Origin-Resource-Policy", "cross-origin")
+    # API JSON routes default to no-store; signed media routes provide their own caching
+    if request.url.path.startswith("/api") and not any(
+        media_sub in request.url.path for media_sub in ("/preview", "/original", "/annotated", "/snapshot")
+    ):
+        response.headers.setdefault("Cache-Control", "no-store")
+    return response
+
+
+@app.middleware("http")
+async def request_context_middleware(request, call_next):
+    """Attach trace request ID and log structured request latency."""
+    rid = request.headers.get("x-request-id") or uuid.uuid4().hex
+    start = time.perf_counter()
+    response = await call_next(request)
+    response.headers["x-request-id"] = rid
+    duration_ms = round((time.perf_counter() - start) * 1000, 1)
+    logger.debug("Request %s %s -> %s (%sms)", request.method, request.url.path, response.status_code, duration_ms)
+    return response
+
+
+@app.middleware("http")
 async def failed_auth_budget(request, call_next):
     """Cap credential probing (API4/API6).
 
@@ -96,6 +125,7 @@ async def failed_auth_budget(request, call_next):
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.origins,
+    allow_origin_regex=settings.allowed_origin_regex.strip() or None,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
@@ -120,7 +150,7 @@ def root():
     }
 
 
-@app.exception_handler(500)
-async def internal_error_handler(request, exc):
-    logging.getLogger(__name__).exception("Unhandled server error", exc_info=exc)
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request, exc):
+    logger.exception("Unhandled server exception on %s", request.url.path, exc_info=exc)
     return JSONResponse(status_code=500, content={"detail": "An unexpected server error occurred. Check API logs for details."})

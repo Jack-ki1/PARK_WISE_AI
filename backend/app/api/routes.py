@@ -44,7 +44,8 @@ ALLOWED_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 VIDEO_WRITERS = ["admin", "operator"]
 
 
-def _video_out(job: VideoJob, db: Session) -> VideoJobOut:
+def _video_out(job: VideoJob, db: Session, *, spaces: int | None = None) -> VideoJobOut:
+    configured_spaces = spaces if spaces is not None else db.query(ParkingSpace).filter(ParkingSpace.video_id == job.id).count()
     return VideoJobOut(
         id=job.id,
         original_name=job.original_name,
@@ -70,7 +71,7 @@ def _video_out(job: VideoJob, db: Session) -> VideoJobOut:
         preview_url=sign_media(f"/api/videos/{job.id}/preview", "video.preview", job.id) if job.preview_path and Path(job.preview_path).exists() else None,
         original_url=sign_media(f"/api/videos/{job.id}/original", "video.original", job.id) if Path(job.file_path).exists() else None,
         annotated_url=sign_media(f"/api/videos/{job.id}/annotated", "video.annotated", job.id) if job.processed_video_path and Path(job.processed_video_path).exists() else None,
-        configured_spaces=db.query(ParkingSpace).filter(ParkingSpace.video_id == job.id).count(),
+        configured_spaces=configured_spaces,
     )
 
 
@@ -191,13 +192,23 @@ def list_videos(
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
 ):
-    """Newest-first page of jobs. Default matches the old unpaginated cap (100)."""
+    """Newest-first page of jobs with batch grouped space count aggregation."""
     jobs = db.query(VideoJob).order_by(VideoJob.created_at.desc()).offset(offset).limit(limit).all()
-    return [_video_out(job, db) for job in jobs]
+    job_ids = [job.id for job in jobs]
+    counts: dict[str, int] = {}
+    if job_ids:
+        rows = (
+            db.query(ParkingSpace.video_id, func.count(ParkingSpace.id))
+            .filter(ParkingSpace.video_id.in_(job_ids))
+            .group_by(ParkingSpace.video_id)
+            .all()
+        )
+        counts = {video_id: count for video_id, count in rows}
+    return [_video_out(job, db, spaces=counts.get(job.id, 0)) for job in jobs]
 
 
 @router.post("/videos/upload", response_model=VideoJobOut, status_code=201, dependencies=[Depends(rate_limit)])
-async def upload_video(file: UploadFile = File(...), user=Depends(current_user), db: Session = Depends(get_db)):
+def upload_video(file: UploadFile = File(...), user=Depends(current_user), db: Session = Depends(get_db)):
     require_roles(user, VIDEO_WRITERS)
     billing.check_can_upload(db)
     extension = Path(file.filename or "").suffix.lower()
@@ -209,7 +220,7 @@ async def upload_video(file: UploadFile = File(...), user=Depends(current_user),
     limit = settings.max_upload_mb * 1024 * 1024
     try:
         with target.open("wb") as dest:
-            while chunk := await file.read(1024 * 1024):
+            while chunk := file.file.read(1024 * 1024):
                 total += len(chunk)
                 if total > limit:
                     raise HTTPException(status_code=413, detail=f"File exceeds the {settings.max_upload_mb} MB limit")
@@ -218,7 +229,7 @@ async def upload_video(file: UploadFile = File(...), user=Depends(current_user),
         target.unlink(missing_ok=True)
         raise
     finally:
-        await file.close()
+        file.file.close()
     try:
         job = _make_job(target, file.filename or target.name, db)
     except HTTPException:

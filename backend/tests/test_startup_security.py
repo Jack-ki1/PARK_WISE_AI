@@ -21,6 +21,30 @@ class TestProductionFailClosed:
         problems = validate_startup_config(settings)
         assert any("ORIGINS" in problem for problem in problems)
 
+    def test_production_rejects_wildcard_origin_regex(self):
+        settings = Settings(
+            env="production",
+            auth_required=True,
+            allowed_origins="https://app.example.com",
+            allowed_origin_regex=".*",
+        )
+        problems = validate_startup_config(settings)
+        assert any("ALLOWED_ORIGIN_REGEX" in problem for problem in problems)
+
+    def test_invalid_origin_regex_fails(self):
+        settings = Settings(env="development", allowed_origin_regex="[invalid(regex")
+        problems = validate_startup_config(settings)
+        assert any("valid regular expression" in problem for problem in problems)
+
+    def test_valid_origin_regex_passes(self):
+        settings = Settings(
+            env="production",
+            auth_required=True,
+            allowed_origins="https://ops.example.com",
+            allowed_origin_regex=r"^https://[a-zA-Z0-9-]+\.vercel\.app$",
+        )
+        assert validate_startup_config(settings) == []
+
     def test_production_valid_config_passes(self):
         settings = Settings(
             env="production", auth_required=True, allowed_origins="https://ops.example.com"
@@ -45,6 +69,10 @@ class TestProductionFailClosed:
         assert is_loopback_bind("[::1]")
         assert not is_loopback_bind("0.0.0.0")
         assert not is_loopback_bind("192.168.1.10")
+
+    def test_corp_header_is_cross_origin(self, client):
+        response = client.get("/api/health")
+        assert response.headers.get("cross-origin-resource-policy") == "cross-origin"
 
 
 class _RedirectHandler(BaseHTTPRequestHandler):

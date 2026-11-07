@@ -20,13 +20,14 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Add backend to path so we can import app modules
-backend_dir = Path(__file__).parent.parent / "backend"
+# Add backend to path so we can import app modules whether called from backend/ or root
+cur = Path(__file__).resolve().parent.parent
+backend_dir = cur if (cur / "app").exists() else cur / "backend"
 sys.path.insert(0, str(backend_dir))
 
-from app.database import SessionLocal, init_db
-from app.models import User
-from app.security import hash_key
+from app.database import SessionLocal, init_db  # noqa: E402
+from app.models import User  # noqa: E402
+from app.security import hash_key  # noqa: E402
 
 
 def bootstrap_admin(username: str, display_name: str, role: str = "admin") -> None:
@@ -39,7 +40,7 @@ def bootstrap_admin(username: str, display_name: str, role: str = "admin") -> No
         # Check if any active admin already exists
         existing_admin = (
             db.query(User)
-            .filter(User.role == "admin", User.is_active == True)
+            .filter(User.role == "admin", User.is_active.is_(True))
             .first()
         )
         
@@ -94,8 +95,8 @@ def bootstrap_admin(username: str, display_name: str, role: str = "admin") -> No
         print("Use this key in requests:")
         print(f"  curl -H 'X-API-Key: {raw_key}' http://localhost:8000/api/health")
         print()
-        print("Or set it in your browser's localStorage:")
-        print(f"  localStorage.setItem('parkwise-api-key', '{raw_key}')")
+        print("Or enter it in the web dashboard under Settings > Users & Access:")
+        print(f"  sessionStorage.setItem('parkwise-session-api-key', '{raw_key}')")
         print()
         print("=" * 80)
         

@@ -1,13 +1,11 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import type { ReactNode } from "react";
 import localFont from "next/font/local";
+import { Providers } from "./providers";
+import "@/styles/tokens.css";
+import "@/styles/base.css";
 import "./globals.css";
 
-// Self-hosted fonts (C0.5): `next/font/google` fetches from Google at build
-// time, which breaks air-gapped/offline builds. The woff2 files under ./fonts
-// are the latin subsets of Plus Jakarta Sans and JetBrains Mono, both licensed
-// under the SIL Open Font License 1.1 and redistributable.
-// Plus Jakarta Sans = display + UI voice; JetBrains Mono = measured numbers.
 const ui = localFont({
   src: "./fonts/PlusJakartaSans-latin.woff2",
   weight: "200 800",
@@ -15,6 +13,7 @@ const ui = localFont({
   display: "swap",
   variable: "--font-ui",
 });
+
 const num = localFont({
   src: "./fonts/JetBrainsMono-latin.woff2",
   weight: "100 800",
@@ -24,21 +23,33 @@ const num = localFont({
 });
 
 export const metadata: Metadata = {
-  title: "ParkWise AI | Parking Intelligence",
-  description: "Real video-based parking analytics and occupancy intelligence.",
+  metadataBase: new URL(process.env.NEXT_PUBLIC_SITE_URL ?? "http://localhost:3000"),
+  title: {
+    default: "ParkWise | Parking Occupancy Intelligence",
+    template: "%s | ParkWise",
+  },
+  description: "Measured per-bay parking occupancy and vehicle tracking from real camera footage.",
+  openGraph: {
+    type: "website",
+    siteName: "ParkWise",
+    title: "ParkWise | Parking Occupancy Intelligence",
+    description: "Measured per-bay parking occupancy from real video.",
+  },
 };
 
-// Applies the stored theme before first paint so the dashboard never flashes.
-// No stored choice defaults to the bright light theme.
-const themeBootstrap = `try{var s=localStorage.getItem("parkwise-theme");var t=s==="light"||s==="dark"?s:"light";document.documentElement.dataset.theme=t;}catch(e){document.documentElement.dataset.theme="light";}`;
+export const viewport: Viewport = {
+  themeColor: [
+    { media: "(prefers-color-scheme: light)", color: "#F7F8FA" },
+    { media: "(prefers-color-scheme: dark)", color: "#0E1116" },
+  ],
+};
 
 export default function RootLayout({ children }: Readonly<{ children: ReactNode }>) {
   return (
     <html lang="en" className={`${ui.variable} ${num.variable}`} suppressHydrationWarning>
-      <head>
-        <script dangerouslySetInnerHTML={{ __html: themeBootstrap }} />
-      </head>
-      <body>{children}</body>
+      <body>
+        <Providers>{children}</Providers>
+      </body>
     </html>
   );
 }

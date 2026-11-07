@@ -1,18 +1,29 @@
 services:
+  proxy:
+    image: caddy:2-alpine
+    container_name: parkwise-proxy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+      - api
+
   api:
     build:
-      # Repo root as context: the image also ships scripts/ (admin bootstrap).
       context: .
       dockerfile: backend/Dockerfile
     container_name: parkwise-api
     restart: unless-stopped
     environment:
       PARKWISE_ENV: ${PARKWISE_ENV:-development}
-      # The container must listen on 0.0.0.0 to accept published ports — and the
-      # startup safety check is told the truth, so auth-off here would (correctly)
-      # refuse to start. Auth therefore defaults to on for Docker deployments.
       PARKWISE_API_HOST: 0.0.0.0
-      PARKWISE_ALLOWED_ORIGINS: ${PARKWISE_ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+      PARKWISE_ALLOWED_ORIGINS: ${PARKWISE_ALLOWED_ORIGINS:-http://localhost,http://127.0.0.1,http://localhost:3000,http://127.0.0.1:3000}
       PARKWISE_DATABASE_URL: ${PARKWISE_DATABASE_URL:-sqlite:////srv/data/parkwise.db}
       PARKWISE_DATA_DIR: /srv/data
       PARKWISE_MAX_UPLOAD_MB: ${PARKWISE_MAX_UPLOAD_MB:-250}
@@ -29,6 +40,8 @@ services:
       PARKWISE_STREAM_WIDTH: ${PARKWISE_STREAM_WIDTH:-960}
       PARKWISE_STREAM_QUALITY: ${PARKWISE_STREAM_QUALITY:-72}
       PARKWISE_STREAM_MAX_SECONDS: ${PARKWISE_STREAM_MAX_SECONDS:-0}
+    expose:
+      - "8000"
     ports:
       - "8000:8000"
     volumes:
@@ -39,21 +52,18 @@ services:
       timeout: 5s
       retries: 5
       start_period: 40s
-    # Video inference can need more RAM than the API alone; tune for the host.
     shm_size: "1gb"
 
   web:
     build:
       context: ./web
       dockerfile: Dockerfile
-      args:
-        # Inlined into the browser bundle at build time — a runtime-only value
-        # would be ignored and the dashboard would keep talking to the default.
-        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
     container_name: parkwise-web
     restart: unless-stopped
     environment:
-      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
+      API_ORIGIN: http://api:8000
+    expose:
+      - "3000"
     ports:
       - "3000:3000"
     depends_on:
@@ -62,3 +72,5 @@ services:
 
 volumes:
   parkwise_data:
+  caddy_data:
+  caddy_config:

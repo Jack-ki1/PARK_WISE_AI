@@ -1,3 +1,4 @@
+import re
 from functools import lru_cache
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -12,7 +13,14 @@ class Settings(BaseSettings):
     api_host: str = "127.0.0.1"
     api_port: int = 8000
     allowed_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
+    # Regex pattern for allowed origins (e.g. r"^https://.*\.vercel\.app$" for Vercel preview deploys).
+    allowed_origin_regex: str = ""
     database_url: str = "sqlite:///./data/parkwise.db"
+    db_pool_size: int = 10
+    db_max_overflow: int = 20
+    db_pool_recycle: int = 1800
+    db_pool_timeout: int = 30
+    redis_url: str = ""
     data_dir: str = "./data"
     max_upload_mb: int = 250
     max_video_seconds: int = 1800
@@ -102,6 +110,15 @@ def validate_startup_config(settings: "Settings") -> list[str]:
         origins = settings.origins
         if not origins or any(origin == "*" for origin in origins):
             problems.append("PARKWISE_ALLOWED_ORIGINS must be an explicit list (no wildcard) in production")
+    if settings.allowed_origin_regex.strip():
+        try:
+            re.compile(settings.allowed_origin_regex)
+        except re.error as exc:
+            problems.append(f"PARKWISE_ALLOWED_ORIGIN_REGEX is not a valid regular expression: {exc}")
+        if settings.env.strip().lower() == "production":
+            raw = settings.allowed_origin_regex.strip()
+            if raw in {".*", ".+", "^.*$", "^.+$"}:
+                problems.append("PARKWISE_ALLOWED_ORIGIN_REGEX must not be an unrestricted wildcard in production")
     if not settings.auth_required and not is_loopback_bind(settings.api_host):
         problems.append(
             f"PARKWISE_AUTH_REQUIRED=false cannot be combined with PARKWISE_API_HOST={settings.api_host}: "
